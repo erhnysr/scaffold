@@ -110,14 +110,37 @@ mkdir -p "$EXT" && cp /tmp/cr/r0vm "$EXT/r0vm" && chmod +x "$EXT/r0vm"
 
 `find_r0vm_path_for_lez` looks at `~/.risc0/extensions/v<risc0-zkvm-version>-cargo-risczero-<arch>-<os>/r0vm`; placing r0vm there is what wires it into a spawned sequencer (scaffold sets `RISC0_SERVER_PATH` from it). The sequencer runs with `RISC0_DEV_MODE=1` (the test-node default), so r0vm executes guests without real proving — which is why no GPU/prover is needed.
 
-**3. Build the real sequencer.** `test-node prepare` downloads the circuits release (via `curl`, automatically) and builds `sequencer_service`. It is long (~6 min); run it, then confirm doctor is green:
+**3. Install the Risc Zero Rust toolchain (required for any `build` / `deploy` of guest programs).** r0vm alone is *not* enough: `logos-scaffold build` (and therefore `deploy`, `run`, and the D3/D6/L-series scenarios) compiles the project's `methods/` guest crate for `riscv32im-risc0-zkvm-elf` via `risc0-build`, which panics with `Risc Zero Rust toolchain not found. Try running rzup install rust` if the toolchain is absent. `test-node prepare` and `setup` (which only build the host-side sequencer/wallet) do *not* need it, which is why the sequencer-only path can look green while `build` fails. Install rzup, then the toolchain:
+
+```bash
+curl -sSL https://risczero.com/install | bash        # installs rzup into ~/.risc0/bin
+export PATH="$HOME/.risc0/bin:$PATH"
+rzup install rust                                     # preferred path
+```
+
+In a TLS-intercepting environment `rzup` fails the same way as its r0vm download (`InvalidCertificate(UnknownIssuer)` — it uses bundled webpki roots and ignores `SSL_CERT_FILE`). Fall back to `curl` for the toolchain tarball and place it in rzup's managed layout by hand (rzup's `default` command is offline — it only writes settings + the `~/.rustup/toolchains/risc0` symlink):
+
+```bash
+# Latest risc0/rust release is r0.1.88.0 (rustc 1.88.0-dev) as of this writing.
+VER=1.88.0; PLAT=x86_64-unknown-linux-gnu
+curl -sSL -H "Authorization: Bearer $GH_TOKEN" -o /tmp/rust-toolchain.tgz \
+  "https://github.com/risc0/rust/releases/download/r0.$VER/rust-toolchain-$PLAT.tar.gz"
+VDIR="$HOME/.risc0/toolchains/v$VER-rust-$PLAT"          # rzup's expected dir name
+mkdir -p "$VDIR" && tar xzf /tmp/rust-toolchain.tgz -C "$VDIR"
+rzup default rust "$VER"                                 # writes settings.toml + rustup 'risc0' symlink
+rustc +risc0 --version                                  # → rustc 1.88.0-dev ...
+```
+
+> Guest-build MSRV gotcha: the LEZ example guest ships **no committed `Cargo.lock`**, so `risc0-build` resolves guest deps fresh. When crates.io publishes deps whose MSRV exceeds the risc0 toolchain's rustc (today `ruint 1.19.0` needs 1.90 and `enum-ordinalize 4.4.1` needs 1.89, but the newest risc0 toolchain is rustc 1.88.0-dev), `build` fails with `rustc 1.88.0-dev is not supported by the following packages`. Work around it by generating an MSRV-compatible lock once — from the project root run `cargo +risc0 generate-lockfile` (the edition-2024 resolver-3 workspace falls back to compatible versions: `ruint 1.17.2`, `enum-ordinalize 4.3.2`) — then re-run `build`. The real fix belongs upstream (pin a guest `Cargo.lock` in the LEZ example).
+
+**4. Build the real sequencer.** `test-node prepare` downloads the circuits release (via `curl`, automatically) and builds `sequencer_service`. It is long (~6 min); run it, then confirm doctor is green:
 
 ```bash
 "$SCAFFOLD_BIN" test-node prepare --project "$P"            # → "test-node prerequisites ready"
 "$SCAFFOLD_BIN" test-node doctor  --project "$P" --json | jq .ok   # → true (all checks pass)
 ```
 
-**4. (Only for real transactions — T4) build the wallet via `setup`.** Two gotchas distinguish `setup` from `test-node prepare`: its circuits precheck does **not** consult the scaffold cache (it only accepts `LOGOS_BLOCKCHAIN_CIRCUITS` or `$HOME/.logos-blockchain-circuits/`), so ensure one of those is present before running it; and it uses cwd discovery, so it must run **inside** the project (no `--project` flag):
+**5. (Only for real transactions — T4) build the wallet via `setup`.** Two gotchas distinguish `setup` from `test-node prepare`: its circuits precheck does **not** consult the scaffold cache (it only accepts `LOGOS_BLOCKCHAIN_CIRCUITS` or `$HOME/.logos-blockchain-circuits/`), so ensure one of those is present before running it; and it uses cwd discovery, so it must run **inside** the project (no `--project` flag):
 
 ```bash
 export LOGOS_BLOCKCHAIN_CIRCUITS="$("$SCAFFOLD_BIN" test-node pins --project "$P" --json | jq -r .circuits_path)"
@@ -128,6 +151,7 @@ Sanity-check the provisioned toolchain before running the T-series:
 
 ```bash
 "$EXT/r0vm" --version
+rustc +risc0 --version                              # risc0 rust toolchain (build/deploy of guest programs)
 ls "$LEZ/target/release/sequencer_service"          # real sequencer (T1–T3)
 ls "$LEZ/target/release/wallet"                     # real wallet (T4)
 ls "$LOGOS_BLOCKCHAIN_CIRCUITS"/pol/verification_key.json
@@ -224,6 +248,8 @@ Use `new` for the main runnable project and `create` as the lightweight alias-pa
 - If `wallet topup` without an address says no destination is configured, record that as a regression in default-wallet seeding or persistence.
 - If `setup` or wallet commands depend on `wallet` being installed globally or on `PATH`, record that as a regression in the self-contained project model.
 - If `deploy` fails due to missing binaries after a successful `build`, capture the exact missing path.
+- Deploying **all** default-template programs in one shot (`deploy` with no program name) can crash the sequencer. The default template ships five guest programs (~390 KB ELF each); when they land in a single block the sequencer aggregates one channel inscription that overflows the LEZ limit and panics in `logos_blockchain_core::mantle::encoding::encode_channel_inscribe` (`Fatal error in 'encode_channel_inscribe' - 1951908 inscription data clipped to 917504`), taking down the localnet. This is an **upstream LEZ** defect, not a scaffold one. Workaround: deploy one program at a time (`deploy hello_world`, etc.) so each inscription stays under the limit — a single ~390 KB program deploys cleanly and the sequencer survives. `localnet status` correctly reports `stale_state` afterward and `localnet start` recovers.
+- `deploy` may print `program_id: unavailable (run logos-scaffold setup to build the vendored spel)` even when `setup` has built spel and `doctor` reports the spel binary as present (all `spel` checks PASS). Deployment still succeeds; only the locally-computed program id is missing. Record this as a scaffold-side spel-resolution/message inconsistency (deploy's program-id path differs from doctor's spel check).
 
 ### Evidence to Capture
 
@@ -489,12 +515,16 @@ From the generated project root:
 ```bash
 export NSSA_WALLET_HOME_DIR="$PWD/.scaffold/wallet"
 cargo run --bin run_hello_world -- <account-id>
-"$SCAFFOLD_BIN" wallet -- account get --account-id <account-id>
+"$SCAFFOLD_BIN" wallet -- account get --account-id Public/<account-id>
 cargo run --bin run_hello_world_with_move_function -- write-public <account-id> "dogfood-test-message"
-"$SCAFFOLD_BIN" wallet -- account get --account-id <account-id>
+"$SCAFFOLD_BIN" wallet -- account get --account-id Public/<account-id>
 ```
 
-The first runner (`run_hello_world`) submits a basic public transaction. The second (`run_hello_world_with_move_function write-public`) writes a custom greeting string to the account, producing an observable `data_b64` field change.
+The first runner (`run_hello_world`) submits a basic public transaction. The second (`run_hello_world_with_move_function write-public`) writes a greeting string to the account, producing an observable `data` field change.
+
+> Address form: the runners take the **bare** base58 `<account-id>`, but `wallet -- account get` requires the **full** `Public/<account-id>` (the LEZ wallet rejects a bare base58 with `Unsupported privacy kind, available variants is Public/ and Private/` and a panic backtrace). The typed reader `test-node account get --url http://127.0.0.1:<port> --account-id <base58>` accepts the bare id and is the cleaner way to observe state (`state: present`, decoded `data`, `nonce`).
+>
+> Note (observed): `write-public` writes a fixed greeting (`data` decodes to `Hola mundo!`, `data_len: 11`) regardless of the message argument passed; the observable change is `Uninitialized` → `present` with non-empty `data` and `nonce: 1`.
 
 ### Expected Success Signals
 
