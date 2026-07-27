@@ -133,6 +133,23 @@ rustc +risc0 --version                                  # → rustc 1.88.0-dev .
 
 > Guest-build MSRV gotcha: the LEZ example guest ships **no committed `Cargo.lock`**, so `risc0-build` resolves guest deps fresh. When crates.io publishes deps whose MSRV exceeds the risc0 toolchain's rustc (today `ruint 1.19.0` needs 1.90 and `enum-ordinalize 4.4.1` needs 1.89, but the newest risc0 toolchain is rustc 1.88.0-dev), `build` fails with `rustc 1.88.0-dev is not supported by the following packages`. Work around it by generating an MSRV-compatible lock once — from the project root run `cargo +risc0 generate-lockfile` (the edition-2024 resolver-3 workspace falls back to compatible versions: `ruint 1.17.2`, `enum-ordinalize 4.3.2`) — then re-run `build`. The real fix belongs upstream (pin a guest `Cargo.lock` in the LEZ example).
 
+**3b. Install the Risc Zero C++ toolchain — required when the guest dep tree contains a C-compiled crate (the `lez-framework` template pulls in `ring`; the `default` template does not).** If any guest dependency uses `cc` and the cpp toolchain is missing, `risc0-build` points `CC` at the placeholder `/no_risc0_cpp_toolchain_installed_run_rzup_install_cpp` and the guest build fails with `error occurred in cc-rs: failed to find tool ".../no_risc0_cpp_toolchain_installed_run_rzup_install_cpp"`. The default template's D-series builds fine without it; the **L-series (`lez-framework`) does not**. Install it the same way as the rust toolchain (rzup, or curl fallback — note the archive nests under `riscv32im-linux-x86_64/`, which must be flattened so `<version-dir>/bin/riscv32-unknown-elf-gcc` exists, the path `risc0-build` builds `CC` from):
+
+```bash
+rzup install cpp                                     # preferred; falls back to curl below
+# curl fallback — only 2024.01.05 is published for risc0/toolchain:
+CVER=2024.1.5; PLAT=x86_64-unknown-linux-gnu
+curl -sSL -H "Authorization: Bearer $GH_TOKEN" -o /tmp/cpp.tar.xz \
+  "https://github.com/risc0/toolchain/releases/download/2024.01.05/riscv32im-linux-x86_64.tar.xz"
+VDIR="$HOME/.risc0/toolchains/v$CVER-cpp-$PLAT"; mkdir -p "$VDIR"
+tar xJf /tmp/cpp.tar.xz -C "$VDIR"
+mv "$VDIR/riscv32im-linux-x86_64/"* "$VDIR/" && rmdir "$VDIR/riscv32im-linux-x86_64"   # flatten
+rzup default cpp "$CVER"
+"$VDIR/bin/riscv32-unknown-elf-gcc" --version         # → riscv32-unknown-elf-gcc 13.2.0
+```
+
+> `ring` host build-dep gotcha (`lez-framework` only): even with the cpp toolchain installed, the `lez-framework` guest fails compiling `ring v0.17.14` with `riscv32-unknown-elf-gcc: error: unrecognized command-line option '-m64'`. `ring` is pulled in as a **host** build-dependency of the guest tree, but `risc0-build` exports an unscoped `CC` (the riscv32 cross-gcc) that `cc-rs` also applies to the host build. Route host build-deps back to the real host compiler by exporting a host-triple-scoped `CC` before `build` / `build idl` / `build client`: `export CC_x86_64_unknown_linux_gnu=/usr/bin/cc HOST_CC=/usr/bin/cc`. The real fix belongs upstream — a zkVM guest should not transitively depend on `ring`.
+
 **4. Build the real sequencer.** `test-node prepare` downloads the circuits release (via `curl`, automatically) and builds `sequencer_service`. It is long (~6 min); run it, then confirm doctor is green:
 
 ```bash
@@ -670,6 +687,7 @@ The `ls` step verifies that LEZ-specific directories were scaffolded before proc
 - If the generated project is missing LEZ-specific paths such as `idl/`, `crates/lez-client-gen/`, or `methods/guest/src/bin/lez_counter.rs`, record that immediately.
 - If LEZ bootstrap behavior diverges from the default template in setup/localnet/doctor flows, capture the difference explicitly.
 - If `build` does not automatically trigger IDL + client generation for the LEZ template, record that as a regression.
+- The `lez-framework` guest has heavier toolchain needs than the default template: it requires the risc0 **C++** toolchain (step 3b in provisioning) and, because its guest tree transitively pulls `ring`, a host-scoped `CC` override (`export CC_x86_64_unknown_linux_gnu=/usr/bin/cc HOST_CC=/usr/bin/cc`) before `build` / `build idl` / `build client`. Without these, `build idl`/`build client` fail inside the guest build (`cc-rs` placeholder-tool error, then `unrecognized command-line option '-m64'`) — verified: with them, `build idl` writes `idl/lez_counter.json` and `build client` generates `src/generated/lez_counter_client.rs`, `_ffi.rs`, and `lez_counter.h`.
 
 ### Evidence to Capture
 
