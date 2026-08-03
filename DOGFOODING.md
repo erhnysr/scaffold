@@ -346,7 +346,7 @@ Use a known default-template program name such as `hello_world`. If the generate
 ### Expected Success Signals
 
 - `deploy hello_world` reports `OK  hello_world submitted` and ends with a human-readable success summary.
-- `deploy --program-path ... --json` prints a parseable JSON object with at least `status`, `program`, and `tx` fields.
+- `deploy --program-path ... --json` prints a parseable JSON object that always carries `status` and `program`, plus `program_id` when it can be computed locally from the ELF. `tx` is present only when the wallet/RPC exposes an inclusion receipt; the pinned LEZ does not, so absent fields are omitted (not nulled) and consumers should test `has("tx")` / `has("program_id")` rather than assume both. Example: `{"program":"hello_world","program_id":"<hex>","status":"submitted"}`.
 - `deploy --program-path ...` without `--json` prints a human-readable `OK` line with the binary path.
 - `deploy nonexistent_program` fails with an error listing the available discovered programs.
 
