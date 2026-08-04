@@ -74,7 +74,7 @@ Scaffold is also consumable as a Rust library (`logos_scaffold::api`): the same 
 
 - Unix-like environment with `git`, `rustc`, `cargo`, `lsof`, `ps`, and `kill`.
 - Docker or Podman available for guest builds.
-- `logos-blockchain-circuits` release on disk when validating older projects without `[circuits]`: set `LOGOS_BLOCKCHAIN_CIRCUITS=<path>` (scaffold no longer consults `~/.logos-blockchain-circuits/`). New projects should carry a `[circuits]` table in `scaffold.toml`; `setup`, `build`, `build idl`, `localnet`, and test-node startup resolve and materialize the configured release instead of relying on ambient shell state.
+- `logos-blockchain-circuits` release on disk when validating older projects without `[circuits]`: set `LOGOS_BLOCKCHAIN_CIRCUITS=<path>` (scaffold no longer consults `~/.logos-blockchain-circuits/`). New projects should carry a `[circuits]` table in `scaffold.toml`; `setup`, `build`, `build idl`, `localnet`, and test-node startup resolve and materialize the configured release instead of relying on ambient shell state. Note that this covers *scaffold-invoked* builds only: a direct `cargo run --bin run_*` (D6, L4) bypasses that injection and still needs `LOGOS_BLOCKCHAIN_CIRCUITS` exported to the project's installed release (`$PWD/.scaffold/circuits`).
 - No conflicting listener on the scaffold localnet port before `localnet start`.
 - Network access available for setup/build flows that fetch dependencies.
 - No preinstalled `wallet` binary is required. If one exists on `PATH`, do not treat it as the runtime under test for scaffold wallet scenarios.
@@ -512,10 +512,25 @@ From the generated project root:
 
 ```bash
 export NSSA_WALLET_HOME_DIR="$PWD/.scaffold/wallet"
+export LOGOS_BLOCKCHAIN_CIRCUITS="$PWD/.scaffold/circuits"
 cargo run --bin run_hello_world -- <account-id-a>
 "$SCAFFOLD_BIN" wallet -- account get --account-id Public/<account-id-a>
 cargo run --bin run_hello_world_with_move_function -- write-public <account-id-b> "dogfood-test-message"
 "$SCAFFOLD_BIN" wallet -- account get --account-id Public/<account-id-b>
+```
+
+`LOGOS_BLOCKCHAIN_CIRCUITS` is required for **direct `cargo run`**, even though
+`setup` already materialized the release into `.scaffold/circuits`. The runners
+pull in `logos-blockchain-pol`, whose build script resolves the circuits
+directory through `logos-blockchain-circuits-utils::circuits_dir()` — that
+lookup reads the env var and otherwise falls back to `~/.logos-blockchain-circuits`,
+which scaffold does not populate. Scaffold's own `build`/`deploy` commands
+inject the path from the `[circuits]` table automatically; a bare `cargo run`
+does not, and fails at build-script time with:
+
+```
+Could not find logos-blockchain-circuits directory. Please either:
+1. Set the LOGOS_BLOCKCHAIN_CIRCUITS environment variable ...
 ```
 
 The first runner (`run_hello_world`) submits a basic public transaction; once committed, account A's data decodes to `Hola mundo!` and its `program_owner` is the hello_world program. The second (`run_hello_world_with_move_function write-public`) writes a custom greeting string to account B, producing an observable `data` field change. Reads are eventually consistent with block production (default localnet block interval 15s) — poll `account get` until the write lands.
@@ -532,6 +547,7 @@ The first runner (`run_hello_world`) submits a basic public transaction; once co
 
 - If a runner exits 0 but the account remains `Uninitialized`, the transaction may have been submitted without effect. Record both the runner output and the account state — and check the sequencer log for `failed execution check` lines: submission-level success does not imply execution-level success.
 - Pointing both runners at the same account is the known execution-rejection case (`UnauthorizedDataModification` — see Preconditions), not a scaffold regression.
+- A `Could not find logos-blockchain-circuits directory` panic from the `logos-blockchain-pol` build script means `LOGOS_BLOCKCHAIN_CIRCUITS` was not exported (see Commands / Actions). It is a missing-export problem, not a regression in `setup`'s circuits materialization — verify with `ls .scaffold/circuits` before filing anything.
 - Panic output from a runner (e.g., `unwrap()` on wallet/sequencer errors) instead of a structured error is worth recording.
 - Invalid account ID format (not base58) should produce a clear parse error from the runner, not a panic.
 - If localnet is down, runners should fail with a connection-refused error. Capture the exact error text.
@@ -545,6 +561,7 @@ The first runner (`run_hello_world`) submits a basic public transaction; once co
 ### Execution Notes
 
 - `NSSA_WALLET_HOME_DIR` must be set for runners that initialize `WalletCore::from_env()`. The scaffold wallet commands set this automatically, but direct `cargo run` does not.
+- `LOGOS_BLOCKCHAIN_CIRCUITS` must likewise be exported for direct `cargo run` (see the note above the command block). This is a *build-time* requirement, so it fails before any runner code executes — do not mistake it for a localnet or wallet problem.
 - Use the fresh public account created in the preconditions rather than reusing accounts from other scenarios. This avoids confusion about pre-existing state.
 - If additional runners are available (e.g., `run_hello_world_private`, `run_hello_world_through_tail_call`), exercising them is valuable but not required for this scenario.
 
