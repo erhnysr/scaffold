@@ -79,7 +79,7 @@ Scaffold is also consumable as a Rust library (`logos_scaffold::api`): the same 
 - Network access available for setup/build flows that fetch dependencies.
 - No preinstalled `wallet` binary is required. If one exists on `PATH`, do not treat it as the runtime under test for scaffold wallet scenarios.
 - Optional but supported: `LOGOS_SCAFFOLD_WALLET_PASSWORD` when validating password override behavior.
-- For `B`-series (basecamp) scenarios: Nix with flakes enabled, plus a module project on disk whose `flake.nix` exposes a `packages.<system>.lgx` output (e.g., a `tictactoe`-style project built against the `logos-module-builder` `tutorial-v1` convention). `docs/basecamp-module-requirements.md` (also reachable via `"$SCAFFOLD_BIN" basecamp docs`) is the canonical contract.
+- For `B`-series (basecamp) scenarios: Nix with flakes enabled (see "Provisioning Nix" — a fresh container has none, and the stock installer needs three fixes here), plus a module project on disk whose `flake.nix` exposes a `packages.<system>.lgx` output (e.g., a `tictactoe`-style project built against the `logos-module-builder` `tutorial-v1` convention). `docs/basecamp-module-requirements.md` (also reachable via `"$SCAFFOLD_BIN" basecamp docs`) is the canonical contract.
 
 The `lgs` binary is a short alias for `logos-scaffold` produced by the same crate; `"$SCAFFOLD_BIN"` and `lgs` are interchangeable in the commands below.
 
@@ -157,6 +157,55 @@ ls "$P"/.scaffold/circuits/pol/verification_key.json   # project-local [circuits
 ```
 
 If any of these is missing, do not "skip the real run" — go back and fix the step that produced it.
+
+## Provisioning Nix (B-series only)
+
+The `B`-series needs Nix with flakes. A fresh container has none, and the stock
+installer fails twice in this environment — both times for reasons that look
+fatal but are not, so route around them rather than declaring the B-series
+unrunnable.
+
+**1. Install, then fix the `nixbld` failure.** As root the installer selects a
+single-user install but still expects the multi-user build-user group, and dies
+with `error: the group 'nixbld' specified in 'build-users-group' does not exist`
+*after* it has already populated `/nix/store`. Write the config first (an empty
+`build-users-group` means "build as the current user"), then re-run the same
+installer — it is idempotent and completes:
+
+```bash
+curl -sSL -o /tmp/nix-install.sh https://nixos.org/nix/install
+sh /tmp/nix-install.sh --no-daemon          # expected to fail on nixbld; continue
+mkdir -p /etc/nix && printf 'build-users-group =\nexperimental-features = nix-command flakes\nsandbox = false\naccess-tokens = github.com=%s\n' "$GH_TOKEN" > /etc/nix/nix.conf
+sh /tmp/nix-install.sh --no-daemon          # → "Installation finished!"
+```
+
+**2. Export `USER` before sourcing the profile.** `nix.sh` is wrapped in
+`if [ -n "$HOME" ] && [ -n "$USER" ]`, and `USER` is unset in non-login
+container shells — so sourcing it silently no-ops and `nix` stays off `PATH`,
+which reads as a broken install:
+
+```bash
+export USER=${USER:-root}
+. /root/.nix-profile/etc/profile.d/nix.sh
+nix --version                                # → nix (Nix) 2.35.1
+```
+
+**3. Bypass the proxy for GitHub, or every flake input 403s.** Nix fetches
+flake inputs over its own libcurl, which honors `HTTPS_PROXY`; the intercepting
+proxy rejects `api.github.com` with a `403` whose body is the
+`GitHub access ... is not enabled for this session` gateway message. That is
+the same proxy behavior the directives above describe for `rzup` and `git push`
+— not a Nix bug and not a token problem. Add the GitHub hosts to `no_proxy`
+(keep TLS verification on; the system CA covers the direct path):
+
+```bash
+export no_proxy="api.github.com,github.com,codeload.github.com,objects.githubusercontent.com,raw.githubusercontent.com,.github.com,.githubusercontent.com"
+export NO_PROXY="$no_proxy"
+nix flake metadata github:NixOS/nixpkgs/nixos-25.05 --no-write-lock-file   # → resolves
+```
+
+Persist all three in `/root/.bashrc` and `/root/.profile` so later turns in the
+same container inherit them.
 
 ## Scenario Index
 
@@ -512,6 +561,7 @@ From the generated project root:
 
 ```bash
 export NSSA_WALLET_HOME_DIR="$PWD/.scaffold/wallet"
+export LOGOS_BLOCKCHAIN_CIRCUITS="$PWD/.scaffold/circuits"
 cargo run --bin run_hello_world -- <account-id-a>
 "$SCAFFOLD_BIN" wallet -- account get --account-id Public/<account-id-a>
 cargo run --bin run_hello_world_with_move_function -- write-public <account-id-b> "dogfood-test-message"
@@ -545,6 +595,7 @@ The first runner (`run_hello_world`) submits a basic public transaction; once co
 ### Execution Notes
 
 - `NSSA_WALLET_HOME_DIR` must be set for runners that initialize `WalletCore::from_env()`. The scaffold wallet commands set this automatically, but direct `cargo run` does not.
+- `LOGOS_BLOCKCHAIN_CIRCUITS` must also be set, for the same reason. A `[circuits]` table means *scaffold* commands resolve the release themselves, but the runners are plain `cargo run` invocations: the `logos-blockchain-pol` build script calls `logos_blockchain_circuits_utils::circuits_dir`, which only consults the env var and `~/.logos-blockchain-circuits`. Without it a fresh project fails to build with `Could not find logos-blockchain-circuits directory` — a build-script panic, before any runner code executes. Point it at the release `setup` already materialized (`$PWD/.scaffold/circuits`); this is not an "override with a local checkout" case.
 - Use the fresh public account created in the preconditions rather than reusing accounts from other scenarios. This avoids confusion about pre-existing state.
 - If additional runners are available (e.g., `run_hello_world_private`, `run_hello_world_through_tail_call`), exercising them is valuable but not required for this scenario.
 
