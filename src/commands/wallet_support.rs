@@ -1,12 +1,14 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
 use serde_json::Value;
 
-use crate::constants::{DEFAULT_WALLET_PASSWORD, WALLET_BIN_REL_PATH};
+use crate::constants::{DEFAULT_WALLET_PASSWORD, WALLET_BIN_REL_PATH, WALLET_HOME_ENV_VARS};
 use crate::model::Project;
 use crate::project::resolve_repo_path;
 use crate::state::write_text;
@@ -14,6 +16,16 @@ use crate::DynResult;
 
 pub(crate) const WALLET_CONFIG_PRIMARY: &str = "wallet_config.json";
 pub(crate) const WALLET_CONFIG_FALLBACK: &str = "config.json";
+
+/// Point a wallet subprocess at `wallet_home` under every env var name the
+/// vendored wallet binary may read (see [`WALLET_HOME_ENV_VARS`]). The path is
+/// passed as an `OsStr` (not via `to_string_lossy`) so a non-UTF8 wallet-home
+/// path reaches the child verbatim instead of being corrupted.
+pub(crate) fn set_wallet_home_env(command: &mut Command, wallet_home: impl AsRef<OsStr>) {
+    for name in WALLET_HOME_ENV_VARS {
+        command.env(name, wallet_home.as_ref());
+    }
+}
 
 pub(crate) struct WalletRuntimeContext {
     pub(crate) wallet_home: PathBuf,
@@ -113,6 +125,48 @@ pub(crate) fn first_public_wallet_address(wallet_home: &Path) -> DynResult<Optio
     }
 
     Ok(None)
+}
+
+/// Extract the first `Public/<base58-account-id>` account from wallet
+/// `account list` output.
+///
+/// In the output shapes captured in this repo (unit tests here and the fake
+/// wallet in `tests/cli.rs`) listing entries render as `/ Public/<account-id>`,
+/// so `/ `-prefixed lines are preferred: the address this returns becomes the
+/// project's default topup destination, and base58 validation alone cannot
+/// tell a listing entry from a real address printed in a banner or status
+/// line.
+///
+/// When the output contains no usable `/ `-prefixed entry, the scan falls back
+/// to any whitespace-separated `Public/<account-id>` token anywhere in the
+/// output. The marker is not a documented contract of the wallet CLI, and
+/// returning `None` here leaves `.scaffold/state/wallet.state` without a
+/// `default_address=` line — the failure scaffold#240 was about — so an
+/// unmarked candidate is better than none.
+///
+/// Either way the account id is validated through [`normalize_address_ref`] —
+/// it must decode to exactly 32 bytes.
+pub(crate) fn first_public_address_in_listing(output: &str) -> Option<String> {
+    let marked = output.lines().find_map(|line| {
+        let entry = line.trim().strip_prefix("/ ")?;
+        public_address_at_start(entry.trim_start())
+    });
+    if marked.is_some() {
+        return marked;
+    }
+
+    output.split_whitespace().find_map(public_address_at_start)
+}
+
+/// Parse a `Public/<base58-account-id>` reference at the start of `text`,
+/// trimming anything after the base58 run (e.g. trailing punctuation).
+fn public_address_at_start(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("Public/")?;
+    let account_id: String = rest
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect();
+    normalize_address_ref(&format!("Public/{account_id}")).ok()
 }
 
 pub(crate) fn wallet_state_path(project_root: &Path) -> PathBuf {
@@ -481,11 +535,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        extract_tx_identifier, first_public_wallet_address, is_already_initialized_failure,
-        is_uninitialized_account_output, normalize_address_ref, read_default_wallet_address,
-        resolve_wallet_address, wallet_state_path, write_default_wallet_address,
-        WALLET_CONFIG_PRIMARY,
+        extract_tx_identifier, first_public_address_in_listing, first_public_wallet_address,
+        is_already_initialized_failure, is_uninitialized_account_output, normalize_address_ref,
+        read_default_wallet_address, resolve_wallet_address, set_wallet_home_env,
+        wallet_state_path, write_default_wallet_address, WALLET_CONFIG_PRIMARY,
     };
+    use crate::constants::WALLET_HOME_ENV_VARS;
 
     const ACCOUNT_ID: &str = "6iArKUXxhUJqS7kCaPNhwMWt3ro71PDyBj7jwAyE2VQV";
 
@@ -654,6 +709,119 @@ mod tests {
 
         let value = first_public_wallet_address(&wallet_home).expect("first public");
         assert!(value.is_none());
+    }
+
+    #[test]
+    fn set_wallet_home_env_sets_every_wallet_home_var() {
+        let mut command = std::process::Command::new("true");
+        set_wallet_home_env(&mut command, "/project/.scaffold/wallet");
+
+        let envs: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        for name in WALLET_HOME_ENV_VARS {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(name)),
+                Some(&Some("/project/.scaffold/wallet".into())),
+                "missing wallet home env var {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn first_public_address_in_listing_parses_wallet_list_output() {
+        // Shape of v0.2.0 `wallet account list` output right after the CLI
+        // initializes its storage on first use.
+        let output = format!(
+            "Persistent storage not found, need to execute setup\n\
+             Input password: \n\
+             Stored persistent accounts at /tmp/wallet-home/storage.json\n\
+             / Public/{ACCOUNT_ID}\n\
+             / Private/2ECgkFTaXzwjJBXR7ZKmXYQtpHbvTTHK9Auma4NL9AUo\n"
+        );
+
+        let value = first_public_address_in_listing(&output);
+        assert_eq!(
+            value.as_deref(),
+            Some(format!("Public/{ACCOUNT_ID}").as_str())
+        );
+    }
+
+    #[test]
+    fn first_public_address_in_listing_skips_invalid_account_ids() {
+        let output = format!(
+            "note: Public/not-base58 is not an address\n\
+             / Public/abc\n\
+             / Public/{ACCOUNT_ID}\n"
+        );
+
+        let value = first_public_address_in_listing(&output);
+        assert_eq!(
+            value.as_deref(),
+            Some(format!("Public/{ACCOUNT_ID}").as_str())
+        );
+    }
+
+    #[test]
+    fn first_public_address_in_listing_returns_none_without_public_entries() {
+        let output = "/ Private/2ECgkFTaXzwjJBXR7ZKmXYQtpHbvTTHK9Auma4NL9AUo\n";
+        assert!(first_public_address_in_listing(output).is_none());
+    }
+
+    /// A wallet build that prints a real, well-formed address in a banner or
+    /// status line before the listing must not have that address adopted as
+    /// the project's default topup destination while the listing itself
+    /// carries `/ `-prefixed entries. Validating base58 alone is not enough,
+    /// because banner addresses are just as valid as entry ones.
+    #[test]
+    fn first_public_address_in_listing_prefers_listing_entries_over_banner_addresses() {
+        const BANNER_ID: &str = "2ECgkFTaXzwjJBXR7ZKmXYQtpHbvTTHK9Auma4NL9AUo";
+
+        let banner_then_listing = format!(
+            "wallet ready; active account Public/{BANNER_ID}\n\
+             Accounts:\n\
+             / Public/{ACCOUNT_ID}\n\
+             / Private/{BANNER_ID}\n"
+        );
+        assert_eq!(
+            first_public_address_in_listing(&banner_then_listing).as_deref(),
+            Some(format!("Public/{ACCOUNT_ID}").as_str()),
+            "the first listing entry wins over any earlier banner address"
+        );
+    }
+
+    /// The `/ ` entry marker is not a documented contract of the wallet CLI.
+    /// A build that prints its accounts without the marker must still yield
+    /// an address: returning `None` here is what leaves `wallet.state` with
+    /// no `default_address=` line (scaffold#240).
+    #[test]
+    fn first_public_address_in_listing_falls_back_when_no_entry_marker_is_present() {
+        let unmarked = format!("Accounts:\n  Public/{ACCOUNT_ID}\n");
+        assert_eq!(
+            first_public_address_in_listing(&unmarked).as_deref(),
+            Some(format!("Public/{ACCOUNT_ID}").as_str()),
+            "an unmarked candidate is better than no default address at all"
+        );
+    }
+
+    /// Pins which account wins on the shape the repo's own fake wallet in
+    /// `tests/cli.rs` prints: an unmarked `Preconfigured Public/<id>` line
+    /// followed by a marked `/ Public/<id>` entry. The marked entry is the
+    /// listing entry, so it is the one adopted.
+    #[test]
+    fn first_public_address_in_listing_prefers_marked_entry_over_earlier_unmarked_line() {
+        const MARKED_ID: &str = "8zxWNm1qh6FLsJpVBuDxdxcTm55qHPgFEdqJpPVu1fuy";
+
+        let output = format!(
+            "Preconfigured Public/{ACCOUNT_ID}\n\
+             / Public/{MARKED_ID}\n"
+        );
+        assert_eq!(
+            first_public_address_in_listing(&output).as_deref(),
+            Some(format!("Public/{MARKED_ID}").as_str()),
+            "a `/ `-marked entry wins over an earlier unmarked Public/ mention"
+        );
     }
 
     #[test]
