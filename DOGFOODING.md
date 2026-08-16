@@ -232,7 +232,7 @@ Use `new` for the main runnable project and `create` as the lightweight alias-pa
 
 - Project creation succeeds and prints the destination path, pinned LEZ commit, and cache root.
 - Generated `scaffold.toml` includes a `[circuits]` table. The default install dir is project-local (`.scaffold/circuits`), and the configured version/download template/install dir become the single source of truth for commands that need `logos-blockchain-circuits`.
-- `setup` completes after syncing LEZ to the configured pin, building both `sequencer_service` and `wallet` inside the project's LEZ tree, and either seeding the default wallet or reporting that a default wallet is already configured. Both seeding paths are a PASS: `default wallet seeded from preconfigured account` when the pinned LEZ debug config ships an `initial_accounts` entry, and `default wallet seeded by initializing wallet storage (config ships no preconfigured account)` on LEZ v0.2.0, whose debug config ships none — there `setup` runs the freshly built `wallet` to create its persistent storage and adopts the first `Public/` account on a `/ `-prefixed listing line, ignoring `Public/` addresses printed anywhere else (a banner or status line); only if no `/ `-prefixed line yields a usable `Public/` address does it fall back to the first `Public/` token anywhere in the output. Either line is followed by `  Address:` and `  State file:`. Only `warning: could not seed default wallet automatically` is a failure. With `--prebuilt`: `sequencer_service` is downloaded instead of built from source (falls back to source build if no artifact is published); `wallet` is always built from source regardless of `--prebuilt`.
+- `setup` completes after syncing LEZ to the configured pin, building both `sequencer_service` and `wallet` inside the project's LEZ tree, and either seeding the default wallet or reporting that a default wallet is already configured. Both seeding paths are a PASS: `default wallet seeded from preconfigured account` when the pinned LEZ debug config ships an `initial_accounts` entry, and `default wallet seeded by initializing wallet storage (config ships no preconfigured account)` on LEZ v0.2.0, whose debug config ships none — there `setup` runs the freshly built `wallet` to create its persistent storage and adopts the first `Public/` account on a `/ `-prefixed listing line, ignoring `Public/` addresses on lines that are not `/ `-prefixed — notably the wallet's own `Preconfigured …` entries, which it prints above the stored accounts even when the config ships no `initial_accounts`, and which a first-token scan would adopt instead of the account the wallet just created. Only if no `/ `-prefixed line yields a usable `Public/` address does it fall back to the first `Public/` token anywhere in the output; if the wallet ever stops `/ `-prefixing stored accounts, that fallback starts adopting a preconfigured address, so a seeded address matching a `Preconfigured` line rather than a `/ ` one is worth reporting. Either line is followed by `  Address:` and `  State file:`. Only `warning: could not seed default wallet automatically` is a failure. With `--prebuilt`: `sequencer_service` is downloaded instead of built from source (falls back to source build if no artifact is published); `wallet` is always built from source regardless of `--prebuilt`.
 - `localnet start` reports a ready localnet rather than only a spawned PID.
 - `build` exits successfully after preparing the project workspace, resolving the configured circuits release, and — when the project has a `methods/Cargo.toml` (Risc0 guest crate excluded from the main workspace) — also prints `Building guest methods...` and produces guest `.bin` files under `target/riscv-guest/<methods-crate>/<guest-crate>/riscv32im-risc0-zkvm-elf/release/`, the same paths `deploy` submits from. The default template uses the workspace `target/` tree, not `methods/target/`.
 - `deploy` prints a submission summary with zero failures when built binaries are present. Multi-program deploys are paced one program per sequencer block (`Waiting for a new block past N before the next deployment ...` between submissions): the pinned LEZ settles each block as a single bedrock inscription with a ~896 KiB payload cap and panics fatally when a block exceeds it, so batching several ~370 KiB deployment ELFs into one block kills the sequencer. Expect roughly one `block_create_timeout` (15s) of wait per additional program. Pacing fails closed: a stalled head or an unreadable post-submission baseline aborts the remaining submissions with `deploy pacing aborted ...` and a non-zero exit rather than batching unpaced (re-run `deploy` for the rest once the sequencer recovers, or raise `LOGOS_SCAFFOLD_DEPLOY_PACING_TIMEOUT_MS` for slow block intervals). A deploy that continues unpaced and crashes localnet mid-flow is a regression; equally, record it if the upstream cap is lifted and pacing becomes dead weight.
@@ -341,18 +341,19 @@ export EXAMPLE_PROGRAMS_BUILD_DIR="$PWD/target/riscv-guest/example_program_deplo
 
 Use a known default-template program name such as `hello_world`. If the generated project exposes a different set of programs in `methods/guest/src/bin`, record the discovered list.
 
-`--json` only produces structured JSON output when combined with `--program-path`. On the discovery-based path (`deploy` or `deploy <name>`), the `--json` flag is accepted but silently ignored. This scenario validates that distinction.
+Both deploy paths honor `--json`, with a different shape each. `--program-path --json` prints one flat object for the single submitted program; the discovery-based path (`deploy` or `deploy <name>`) wraps one such object per attempted program in `{"deploys":[…]}`. Either way `--json` is pure JSON on stdout — no command echoes, no summary block. This scenario validates that distinction. (Both shapes omit absent fields rather than emitting `null`: today the pinned LEZ exposes no transaction receipt for a deploy, so `tx` is always absent and consumers test `has("tx")` rather than branching on a guaranteed-null key. `program_id` is present whenever the vendored `spel` binary resolved it, and a failed entry carries `error` in its place.)
 
 ### Expected Success Signals
 
 - `deploy hello_world` reports `OK  hello_world submitted` and ends with a human-readable success summary.
-- `deploy --program-path ... --json` prints a parseable JSON object with at least `status`, `program`, and `tx` fields.
+- `deploy --program-path ... --json` prints a parseable JSON object with at least `status` and `program` (plus `program_id` once `setup` has built `spel`).
+- `deploy <name> --json` and bare `deploy --json` print a parseable `{"deploys":[…]}` object whose entries carry the same fields.
 - `deploy --program-path ...` without `--json` prints a human-readable `OK` line with the binary path.
 - `deploy nonexistent_program` fails with an error listing the available discovered programs.
 
 ### Failure Signals / Common Pitfalls
 
-- If `deploy hello_world --json` starts producing JSON output (instead of the normal human-readable summary), record that as a behavior change worth verifying.
+- If either `--json` path starts emitting a guaranteed-null `tx` key, or mixes command echoes and the human-readable summary into the JSON stream, record that as a machine-readability regression.
 - If localnet is unreachable, deploy should fail with a sequencer-unavailable hint instead of a vague wallet error.
 - Unknown program names should report the available discovered programs.
 - Missing binaries should point back to `logos-scaffold build`.
@@ -360,13 +361,13 @@ Use a known default-template program name such as `hello_world`. If the generate
 ### Evidence to Capture
 
 - One successful human-readable deploy excerpt from the discovery path.
-- One successful JSON deploy output from the `--program-path` path.
+- One successful JSON deploy output from the `--program-path` path, and one `{"deploys":[…]}` output from the discovery path.
 - The error output for an unknown program name.
 - Any failure-path excerpt for unreachable sequencer or missing binary when intentionally probed.
 
 ### Execution Notes
 
-- Keep the `--program-path --json` examples separate from discovery-based deploys. Only `--program-path` produces JSON.
+- Record both JSON shapes: the flat object from `--program-path` and the `{"deploys":[…]}` wrapper from the discovery path. They are separate contracts and a change to one does not imply a change to the other.
 - When recording a custom `--program-path`, preserve the absolute path used in the run log.
 
 ## D4. Default Template Wallet Workflows and Passthrough
@@ -632,7 +633,7 @@ post_deploy = ["echo 'topup skipped:' $SCAFFOLD_TOPUP_SKIPPED"]
 ### Failure Signals / Common Pitfalls
 
 - A `run` invocation that restarts the sequencer when one is already running healthy is a regression in the localnet-reuse path.
-- Hooks running with `cwd` somewhere other than the project root, or missing any of `SEQUENCER_URL` / `NSSA_WALLET_HOME_DIR` / `LEE_WALLET_HOME_DIR` / `SCAFFOLD_PROJECT_ROOT` / `SCAFFOLD_IDL_DIR`, is a regression in the env contract. `NSSA_WALLET_HOME_DIR` and `LEE_WALLET_HOME_DIR` must both be set and must print the same path; one of them empty means hooks that exec the wallet binary silently target `~/.lee/wallet` on one of the two LEZ pins.
+- Hooks running with `cwd` somewhere other than the project root, or missing any of `SEQUENCER_URL` / `NSSA_WALLET_HOME_DIR` / `LEE_WALLET_HOME_DIR` / `SCAFFOLD_PROJECT_ROOT` / `SCAFFOLD_IDL_DIR` / `SCAFFOLD_TOPUP_SKIPPED` / `SCAFFOLD_DEPLOY_SKIPPED`, is a regression in the env contract. The last two are `1`/`0` and are **always set, never absent** — an unset one is itself the regression, since a hook cannot tell "scaffold did the step" from "this scaffold cannot report"; a value that disagrees with the step header printed in the same run (e.g. `[4/6] Topup skipped …` with `SCAFFOLD_TOPUP_SKIPPED=0`) is a worse one. `NSSA_WALLET_HOME_DIR` and `LEE_WALLET_HOME_DIR` must both be set and must print the same path; one of them empty means hooks that exec the wallet binary silently target `~/.lee/wallet` on one of the two LEZ pins.
 - `$SCAFFOLD_PROGRAM_ID` unset after a successful deploy on a single-program project with a vendored `spel` binary is a regression. Hint: `lgs setup` builds the spel binary; if it's missing, `program_id: unavailable` will also appear in the deploy summary.
 
 ### Evidence to Capture
@@ -1035,9 +1036,9 @@ Validate that a module project can fetch the pinned basecamp + `lgpm` binaries, 
 
 ### Preconditions
 
-- Nix with flakes enabled.
+- Nix with flakes enabled — **and unrestricted GitHub access for Nix specifically**. This is a stricter requirement than the rest of this runbook and the usual reason a `B`-series run stalls in an agent container, so check it before installing anything. Nix resolves `github:` flake inputs over `https://api.github.com/repos/…/commits/HEAD` and `https://github.com/…/archive/<rev>.tar.gz`; a proxy that allowlists GitHub per repository answers `403` on both, and the basecamp closure pulls ~25 repos across `logos-co`, `NixOS/nixpkgs` and `oxalica/rust-overlay`. Neither `git clone` working nor `nix --version` working proves this — probe it directly with `curl -sS -o /dev/null -w '%{http_code}\n' https://api.github.com/repos/NixOS/nixpkgs/commits/HEAD` (expect `200`) before starting. Rewriting the project's own input to `git+https://` does not help: the transitive inputs are already locked as `github:` inside each dependency's own `flake.lock`. If the probe fails, `B1`–`B6` are out of reach in that environment and the honest result is to record the blocker — the scaffold-side surface that needs no Nix (`basecamp --help`, `basecamp docs`, the missing-Nix hint, `basecamp doctor`, out-of-project errors) is still worth exercising and reporting as partial coverage.
 - Latest scaffold binary built from the repo root (`"$SCAFFOLD_BIN"`).
-- A module project on disk whose `flake.nix` exposes `packages.<system>.lgx` (see `"$SCAFFOLD_BIN" basecamp docs`). Reachable as `$MODULE_PROJECT`.
+- A module project on disk whose `flake.nix` exposes `packages.<system>.lgx` (see `"$SCAFFOLD_BIN" basecamp docs`). Reachable as `$MODULE_PROJECT`. `logos-module-builder`'s `templates/minimal-module` is the smallest one that satisfies the contract.
 - `scaffold.toml` is present at the project root; if not, run `"$SCAFFOLD_BIN" init` once.
 
 ### Commands / Actions
