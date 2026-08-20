@@ -448,6 +448,14 @@ fn cmd_basecamp_launch(
         bail!("no modules captured — run `logos-scaffold basecamp modules` before launching.");
     }
 
+    // Same fail-fast reasoning as the bail above: prepare the runtime dir
+    // before the scrub + reinstall, not after. A hostile or unusable one is
+    // then reported in milliseconds instead of after a multi-minute nix
+    // build, and without having already wiped the profile.
+    let runtime_dir =
+        resolve_profile_runtime_dir(&project.root, &profile, project.config.basecamp.as_ref());
+    ensure_private_runtime_dir(&runtime_dir)?;
+
     // Pre-seed in case a prior crash between scrub and re-seed left the profile
     // without its xdg subdirs; scrub assumes both exist. seed_profiles is
     // idempotent and cheap.
@@ -491,12 +499,7 @@ fn cmd_basecamp_launch(
         }
     }
 
-    let runtime_dir =
-        resolve_profile_runtime_dir(&project.root, &profile, project.config.basecamp.as_ref());
-    if let Some(rt) = &runtime_dir {
-        fs::create_dir_all(rt).with_context(|| format!("create runtime dir {}", rt.display()))?;
-    }
-    let mut env = launch_env(&profile_dir, &profile, runtime_dir.as_deref());
+    let mut env = launch_env(&profile_dir, &profile, &runtime_dir);
     // Layer scaffold.toml-declared launch env on top of the scaffold-owned
     // base (#163): [basecamp.env_append] path joins, then the per-profile
     // env_file, then [basecamp.env] globals, then
@@ -650,10 +653,11 @@ struct BasecampProfilePaths {
     xdg_config_home: String,
     xdg_data_home: String,
     xdg_cache_home: String,
-    /// `TMPDIR` launch would export (runtime_dir if resolved, else `xdg-tmp`).
+    /// `TMPDIR` launch would export. Same value as `xdg_runtime_dir`.
     tmpdir: String,
-    /// `XDG_RUNTIME_DIR` launch would export; `None` when no runtime_dir resolves.
-    xdg_runtime_dir: Option<String>,
+    /// `XDG_RUNTIME_DIR` launch would export. Always resolves; see
+    /// [`resolve_profile_runtime_dir`].
+    xdg_runtime_dir: String,
     modules_dir: String,
     plugins_dir: String,
     launch_state: String,
@@ -676,9 +680,7 @@ fn cmd_basecamp_paths(project: Project, profile: String, json: bool) -> DynResul
     let (modules_dir, plugins_dir) =
         profile_modules_and_plugins(&profiles_root, &profile, basecamp_repo);
     let runtime_dir = resolve_profile_runtime_dir(&project.root, &profile, bc);
-    let tmpdir = runtime_dir
-        .clone()
-        .unwrap_or_else(|| profile_dir.join("xdg-tmp"));
+    let tmpdir = runtime_dir.clone();
     let profile_cfg = bc.and_then(|c| c.profiles.get(&profile));
     let log_file = profile_cfg
         .and_then(|p| p.log_file.as_deref())
@@ -695,7 +697,7 @@ fn cmd_basecamp_paths(project: Project, profile: String, json: bool) -> DynResul
         xdg_data_home: profile_dir.join("xdg-data").display().to_string(),
         xdg_cache_home: profile_dir.join("xdg-cache").display().to_string(),
         tmpdir: tmpdir.display().to_string(),
-        xdg_runtime_dir: runtime_dir.as_ref().map(|p| p.display().to_string()),
+        xdg_runtime_dir: runtime_dir.display().to_string(),
         modules_dir: modules_dir.display().to_string(),
         plugins_dir: plugins_dir.display().to_string(),
         launch_state: profile_dir.join("launch.state").display().to_string(),
@@ -712,10 +714,7 @@ fn cmd_basecamp_paths(project: Project, profile: String, json: bool) -> DynResul
         println!("  xdg_data_home:    {}", paths.xdg_data_home);
         println!("  xdg_cache_home:   {}", paths.xdg_cache_home);
         println!("  tmpdir:           {}", paths.tmpdir);
-        println!(
-            "  xdg_runtime_dir:  {}",
-            paths.xdg_runtime_dir.as_deref().unwrap_or("(unset)")
-        );
+        println!("  xdg_runtime_dir:  {}", paths.xdg_runtime_dir);
         println!("  modules_dir:      {}", paths.modules_dir);
         println!("  plugins_dir:      {}", paths.plugins_dir);
         println!("  launch_state:     {}", paths.launch_state);
@@ -729,13 +728,12 @@ fn cmd_basecamp_paths(project: Project, profile: String, json: bool) -> DynResul
 }
 
 /// Env map exported to the basecamp child on launch. Scaffold-owned names only;
-/// module port-override vars are not yet registered. `runtime_dir`, when set,
-/// becomes both `TMPDIR` and `XDG_RUNTIME_DIR`; otherwise `TMPDIR` falls back to
-/// the in-profile `xdg-tmp`.
+/// module port-override vars are not yet registered. `runtime_dir` becomes both
+/// `TMPDIR` and `XDG_RUNTIME_DIR`.
 fn launch_env(
     profile_dir: &Path,
     profile_name: &str,
-    runtime_dir: Option<&Path>,
+    runtime_dir: &Path,
 ) -> BTreeMap<String, OsString> {
     let mut env = BTreeMap::new();
     env.insert(
@@ -762,18 +760,8 @@ fn launch_env(
     // A short `runtime_dir` (e.g. `/tmp/lgs-<profile>`) additionally dodges the
     // macOS `sun_path == 104` Unix-socket path limit that the long in-profile
     // `xdg-tmp` path can exceed; it also sets `XDG_RUNTIME_DIR`.
-    match runtime_dir {
-        Some(rt) => {
-            env.insert("TMPDIR".into(), rt.as_os_str().to_owned());
-            env.insert("XDG_RUNTIME_DIR".into(), rt.as_os_str().to_owned());
-        }
-        None => {
-            env.insert(
-                "TMPDIR".into(),
-                profile_dir.join("xdg-tmp").into_os_string(),
-            );
-        }
-    }
+    env.insert("TMPDIR".into(), runtime_dir.as_os_str().to_owned());
+    env.insert("XDG_RUNTIME_DIR".into(), runtime_dir.as_os_str().to_owned());
     env.insert("LOGOS_PROFILE".into(), profile_name.into());
     env
 }
@@ -881,23 +869,132 @@ fn absolutize(base: &Path, path: &Path) -> PathBuf {
 
 /// Resolve the per-profile runtime dir (`TMPDIR` / `XDG_RUNTIME_DIR` root).
 /// Precedence: configured `[basecamp.profiles.<name>].runtime_dir`
-/// (project-relative or absolute) > macOS default `/tmp/lgs-<profile>` > `None`
-/// (Linux keeps the in-profile `xdg-tmp`).
+/// (project-relative or absolute) > `/tmp/lgs-<project-hash>-<profile>`.
+///
+/// Always resolves — there is deliberately no `None` case. A profile without a
+/// temp root of its own would fall back to a shared `/tmp`, which is the
+/// cross-profile `logos_token_<module>` collision #89 guards against; a
+/// fallback *inside* the profile dir reintroduces the socket-in-the-flake-tree
+/// build failure this default exists to avoid. Returning `PathBuf` keeps both
+/// out of reach by construction.
 fn resolve_profile_runtime_dir(
     project_root: &Path,
     profile: &str,
     basecamp: Option<&BasecampConfig>,
-) -> Option<PathBuf> {
+) -> PathBuf {
     if let Some(rt) = basecamp
         .and_then(|bc| bc.profiles.get(profile))
         .and_then(|p| p.runtime_dir.as_deref())
     {
-        return Some(project_root.join(rt));
+        return project_root.join(rt);
     }
-    if cfg!(target_os = "macos") {
-        return Some(PathBuf::from(format!("/tmp/lgs-{profile}")));
+    // Default: a short, project-scoped temp root OUTSIDE the project tree.
+    //
+    // It must live outside the project because a module project's flake is
+    // usually the project root itself, and `nix build path:<root>#lgx` copies
+    // that whole tree into the store. `launch` leaves a live `logos_token_*`
+    // Unix socket in the profile's temp dir, and nix refuses to copy a socket
+    // ("file ... has an unsupported type"), so an in-project temp root made
+    // every `basecamp install` / `basecamp launch` after the first launch fail
+    // — and made concurrent alice/bob launches (B3) fail against each other's
+    // live sockets, which no amount of scrubbing can fix.
+    //
+    // The project-root hash keeps two checkouts from sharing a temp root, and
+    // the whole path stays far below the macOS `sun_path == 104` budget that
+    // the long in-profile path could exceed.
+    PathBuf::from(format!(
+        "/tmp/lgs-{}-{profile}",
+        project_root_tag(project_root)
+    ))
+}
+
+/// Create the per-profile runtime dir as a private (0700) directory we own.
+///
+/// The default runtime dir lives under `/tmp`, which is world-writable, and
+/// its name is derived from the project path rather than a secret — so another
+/// local user can pre-create it and wait. The sticky bit stops them removing a
+/// dir we already own, but not claiming the name first. Whatever ends up there
+/// holds the modules' `logos_token_*` sockets, so a hostile or merely
+/// world-readable dir means another user can reach a running module.
+///
+/// Three cases:
+/// - Missing: create it with 0700 already set, so there is no window in which
+///   it exists with umask-derived permissions.
+/// - Ours: tighten to 0700 if the mode is loose.
+/// - Someone else's: `set_permissions` fails with `EPERM`, which is the
+///   ownership check — no `libc::getuid` needed.
+///
+/// A symlink is rejected outright rather than followed, so a pre-planted link
+/// cannot redirect the sockets somewhere else.
+fn ensure_private_runtime_dir(dir: &Path) -> DynResult<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!(
+                    "refusing to use runtime dir {} — it is a symlink. Remove it, or point \
+                     `[basecamp.profiles.<profile>].runtime_dir` somewhere you control.",
+                    dir.display()
+                );
+            }
+            if !meta.is_dir() {
+                bail!(
+                    "refusing to use runtime dir {} — it exists but is not a directory.",
+                    dir.display()
+                );
+            }
+            if meta.permissions().mode() & 0o077 != 0 {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| {
+                    format!(
+                        "cannot restrict permissions on runtime dir {} — it is owned by another \
+                         user. Remove it, or set `[basecamp.profiles.<profile>].runtime_dir`.",
+                        dir.display()
+                    )
+                })?;
+            }
+        }
+        Err(_) => {
+            if let Some(parent) = dir.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(dir)
+                .with_context(|| format!("create runtime dir {}", dir.display()))?;
+        }
     }
-    None
+
+    // Re-check after the fact: a racing swap between the stat above and the
+    // chmod would otherwise go unnoticed.
+    let meta =
+        fs::symlink_metadata(dir).with_context(|| format!("stat runtime dir {}", dir.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        bail!(
+            "runtime dir {} changed type while being prepared — refusing to launch.",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Short, stable tag for a project root — first 8 hex of the sha256 of its
+/// canonical path. Used to scope shared-temp paths per project.
+fn project_root_tag(project_root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canon = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canon.as_os_str().as_encoded_bytes());
+    let digest = hasher.finalize();
+    use std::fmt::Write as _;
+    let mut tag = String::new();
+    for byte in &digest[..4] {
+        let _ = write!(tag, "{byte:02x}");
+    }
+    tag
 }
 
 /// `lgs basecamp develop <module>` — enter a module's Nix dev shell.
@@ -1144,7 +1241,13 @@ fn scrub_profile_data_and_cache(project_root: &Path, profile_dir: &Path) -> DynR
             canon_safe.display()
         );
     }
-    for xdg in ["xdg-data", "xdg-cache"] {
+    for xdg in ["xdg-data", "xdg-cache", "xdg-tmp"] {
+        // `xdg-tmp` is the legacy in-profile temp root. Newly launched
+        // profiles get a temp root outside the project (see
+        // `resolve_profile_runtime_dir`), but a profile launched by an older
+        // scaffold still has stale `logos_token_*` sockets here — and any
+        // socket inside the project tree breaks `nix build path:<root>#...`.
+        // Scrubbing it lets such a project heal itself on the next launch.
         let dir = profile_dir.join(xdg);
         if dir.exists() {
             fs::remove_dir_all(&dir).with_context(|| format!("scrub {}", dir.display()))?;
@@ -2902,12 +3005,17 @@ pub(crate) fn compute_module_drift(project: &Project) -> DynResult<ModuleDriftRe
     )
     .unwrap_or_default();
 
+    // Compare on the normalized (absolutized) form. `basecamp modules`
+    // persists in-project sources relatively (`path:.#lgx`) so a committed
+    // scaffold.toml stays portable, while discovery yields the absolute
+    // `path:/abs/root#lgx`. Comparing the raw strings made every in-project
+    // flake look permanently uncaptured.
     let captured_flakes: std::collections::HashSet<String> = project
         .config
         .modules
         .values()
         .filter(|e| e.role == ModuleRole::Project)
-        .map(|e| e.flake.clone())
+        .map(|e| normalize_flake_ref(&project.root, &e.flake))
         .collect();
 
     let mut discovered_not_captured: Vec<BasecampSource> = discovered_project
@@ -2985,6 +3093,57 @@ fn push_basecamp_doctor_rows(project: &Project, rows: &mut Vec<crate::model::Che
 
     let profiles_root = project.root.join(BASECAMP_PROFILES_REL);
     let basecamp_repo = project.config.basecamp_repo.as_ref();
+
+    // Setup-level rows: the two binaries `basecamp setup` builds and the two
+    // profiles it seeds. Without these a green `setup` produced a doctor with
+    // no PASS rows at all, so a user had no way to confirm setup actually
+    // landed before moving on to `modules` / `install`.
+    for (label, recorded) in [
+        ("basecamp binary", state.basecamp_bin.as_str()),
+        ("lgpm binary", state.lgpm_bin.as_str()),
+    ] {
+        if recorded.is_empty() {
+            rows.push(CheckRow {
+                status: CheckStatus::Fail,
+                name: label.to_string(),
+                detail: "not recorded in .scaffold/state/basecamp.state".to_string(),
+                remediation: Some("run `logos-scaffold basecamp setup`".to_string()),
+            });
+        } else if Path::new(recorded).exists() {
+            rows.push(CheckRow {
+                status: CheckStatus::Pass,
+                name: label.to_string(),
+                detail: format!("found {recorded}"),
+                remediation: None,
+            });
+        } else {
+            rows.push(CheckRow {
+                status: CheckStatus::Fail,
+                name: label.to_string(),
+                detail: format!("recorded at {recorded} but the path is missing"),
+                remediation: Some("run `logos-scaffold basecamp setup` to rebuild it".to_string()),
+            });
+        }
+    }
+
+    for profile in [BASECAMP_PROFILE_ALICE, BASECAMP_PROFILE_BOB] {
+        let profile_dir = profiles_root.join(profile);
+        if profile_dir.is_dir() {
+            rows.push(CheckRow {
+                status: CheckStatus::Pass,
+                name: format!("basecamp profile {profile}"),
+                detail: format!("seeded at {}", profile_dir.display()),
+                remediation: None,
+            });
+        } else {
+            rows.push(CheckRow {
+                status: CheckStatus::Fail,
+                name: format!("basecamp profile {profile}"),
+                detail: format!("missing {}", profile_dir.display()),
+                remediation: Some("run `logos-scaffold basecamp setup`".to_string()),
+            });
+        }
+    }
     let alice_modules = profiles_root
         .join(BASECAMP_PROFILE_ALICE)
         .join("xdg-data")
@@ -4221,7 +4380,7 @@ mod tests {
     #[test]
     fn launch_env_exports_xdg_under_profile_dir_and_profile_name() {
         let profile_dir = Path::new("/p/alice");
-        let env = launch_env(profile_dir, "alice", None);
+        let env = launch_env(profile_dir, "alice", Path::new("/tmp/lgs-t-alice"));
         assert_eq!(
             env.get("XDG_CONFIG_HOME").unwrap(),
             &OsString::from("/p/alice/xdg-config")
@@ -4235,10 +4394,12 @@ mod tests {
             &OsString::from("/p/alice/xdg-cache")
         );
         // #89: per-profile TMPDIR prevents the cross-profile QLocalServer
-        // socket-name collision that SIGSEGVs Qt RemoteObjects.
+        // socket-name collision that SIGSEGVs Qt RemoteObjects. It is the
+        // resolved runtime dir, never a path inside the profile (and so never
+        // inside the project) — see `resolve_profile_runtime_dir`.
         assert_eq!(
             env.get("TMPDIR").unwrap(),
-            &OsString::from("/p/alice/xdg-tmp")
+            &OsString::from("/tmp/lgs-t-alice")
         );
         assert_eq!(env.get("LOGOS_PROFILE").unwrap(), &OsString::from("alice"));
     }
@@ -4263,7 +4424,11 @@ mod tests {
             },
         );
 
-        let mut env = launch_env(Path::new("/p/alice"), "alice", None);
+        let mut env = launch_env(
+            Path::new("/p/alice"),
+            "alice",
+            Path::new("/tmp/lgs-t-alice"),
+        );
         apply_launch_env_overrides(&mut env, &cfg, "alice", &BTreeMap::new(), |k| {
             (k == "QT_PLUGIN_PATH").then(|| OsString::from("/usr/lib/qt/plugins"))
         });
@@ -4305,7 +4470,11 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let mut env = launch_env(Path::new("/p/alice"), "alice", None);
+        let mut env = launch_env(
+            Path::new("/p/alice"),
+            "alice",
+            Path::new("/tmp/lgs-t-alice"),
+        );
         apply_launch_env_overrides(&mut env, &cfg, "alice", &env_file_vars, |_| None);
         // global env wins over env_file for the shared key.
         assert_eq!(env.get("SHARED").unwrap(), &OsString::from("from-global"));
@@ -4352,7 +4521,7 @@ mod tests {
         let mut cfg = BasecampConfig::default();
         cfg.env_append
             .insert("LD_LIBRARY_PATH".into(), vec!["/nix/store/x/lib".into()]);
-        let mut env = launch_env(Path::new("/p/bob"), "bob", None);
+        let mut env = launch_env(Path::new("/p/bob"), "bob", Path::new("/tmp/lgs-t-bob"));
         apply_launch_env_overrides(&mut env, &cfg, "bob", &BTreeMap::new(), |_| None);
         assert_eq!(
             env.get("LD_LIBRARY_PATH").unwrap(),
@@ -4369,7 +4538,7 @@ mod tests {
         let mut cfg = BasecampConfig::default();
         cfg.env_append
             .insert("LD_LIBRARY_PATH".into(), vec!["/nix/store/x/lib".into()]);
-        let mut env = launch_env(Path::new("/p/bob"), "bob", None);
+        let mut env = launch_env(Path::new("/p/bob"), "bob", Path::new("/tmp/lgs-t-bob"));
         let weird_for_closure = weird.clone();
         apply_launch_env_overrides(&mut env, &cfg, "bob", &BTreeMap::new(), move |k| {
             (k == "LD_LIBRARY_PATH").then(|| weird_for_closure.clone())
@@ -4391,7 +4560,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut bob_env = launch_env(Path::new("/p/bob"), "bob", None);
+        let mut bob_env = launch_env(Path::new("/p/bob"), "bob", Path::new("/tmp/lgs-t-bob"));
         apply_launch_env_overrides(&mut bob_env, &cfg, "bob", &BTreeMap::new(), |_| None);
         assert!(
             bob_env.get("PORT").is_none(),
@@ -4402,16 +4571,25 @@ mod tests {
     #[test]
     fn launch_env_tmpdir_is_distinct_per_profile() {
         // The whole point of #89: alice and bob must not share a temp root,
-        // or their `logos_token_<module>` sockets collide.
-        let alice = launch_env(Path::new("/p/alice"), "alice", None);
-        let bob = launch_env(Path::new("/p/bob"), "bob", None);
+        // or their `logos_token_<module>` sockets collide. The distinctness
+        // now originates in `resolve_profile_runtime_dir` (launch_env just
+        // exports what it is handed), so assert it at the source and then
+        // confirm launch_env propagates it to both names.
+        let tmp = tempdir().expect("tempdir");
+        let alice_rt = resolve_profile_runtime_dir(tmp.path(), "alice", None);
+        let bob_rt = resolve_profile_runtime_dir(tmp.path(), "bob", None);
+        assert_ne!(alice_rt, bob_rt);
+
+        let alice = launch_env(Path::new("/p/alice"), "alice", &alice_rt);
+        let bob = launch_env(Path::new("/p/bob"), "bob", &bob_rt);
         assert_ne!(alice.get("TMPDIR"), bob.get("TMPDIR"));
+        assert_ne!(alice.get("XDG_RUNTIME_DIR"), bob.get("XDG_RUNTIME_DIR"));
     }
 
     #[test]
     fn launch_env_runtime_dir_sets_tmpdir_and_xdg_runtime_dir() {
         let rt = Path::new("/tmp/lgs-alice");
-        let env = launch_env(Path::new("/p/alice"), "alice", Some(rt));
+        let env = launch_env(Path::new("/p/alice"), "alice", rt);
         assert_eq!(
             env.get("TMPDIR").unwrap(),
             &OsString::from("/tmp/lgs-alice")
@@ -4449,8 +4627,136 @@ mod tests {
         // Configured path wins (project-relative -> joined to root) on any OS.
         assert_eq!(
             resolve_profile_runtime_dir(Path::new("/proj"), "alice", Some(&cfg)),
-            Some(PathBuf::from("/proj/run/alice"))
+            PathBuf::from("/proj/run/alice")
         );
+    }
+
+    #[test]
+    fn captured_relative_flake_ref_normalizes_to_the_discovered_form() {
+        // Regression: `basecamp modules` persists in-project sources
+        // relatively (`path:.#lgx`) while discovery yields the absolute
+        // `path:/abs/root#lgx`. `compute_module_drift` compared the raw
+        // strings, so a captured project-root flake was reported as
+        // permanently "uncaptured" drift.
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let discovered = flake_ref(&BasecampSource::Flake(format!(
+            "path:{}#lgx",
+            canon.display()
+        )));
+        assert_eq!(normalize_flake_ref(root, "path:.#lgx"), discovered);
+    }
+
+    #[test]
+    fn ensure_private_runtime_dir_creates_it_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("rt");
+        ensure_private_runtime_dir(&dir).expect("create");
+        let mode = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "got {:o}", mode & 0o777);
+    }
+
+    #[test]
+    fn ensure_private_runtime_dir_tightens_loose_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("rt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        ensure_private_runtime_dir(&dir).expect("tighten");
+
+        let mode = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "group/other bits survived: {:o}", mode);
+    }
+
+    #[test]
+    fn ensure_private_runtime_dir_rejects_a_symlink() {
+        // A pre-planted symlink in world-writable /tmp must not be followed —
+        // it would redirect the modules' `logos_token_*` sockets.
+        let tmp = tempdir().expect("tempdir");
+        let target = tmp.path().join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        let link = tmp.path().join("rt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = ensure_private_runtime_dir(&link).expect_err("symlink must be rejected");
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+    }
+
+    #[test]
+    fn ensure_private_runtime_dir_rejects_a_non_directory() {
+        let tmp = tempdir().expect("tempdir");
+        let file = tmp.path().join("rt");
+        fs::write(&file, b"x").unwrap();
+
+        let err = ensure_private_runtime_dir(&file).expect_err("file must be rejected");
+        assert!(err.to_string().contains("not a directory"), "got: {err}");
+    }
+
+    #[test]
+    fn ensure_private_runtime_dir_is_idempotent() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("rt");
+        ensure_private_runtime_dir(&dir).expect("first");
+        fs::write(dir.join("logos_token_x"), b"x").unwrap();
+        ensure_private_runtime_dir(&dir).expect("second");
+        assert!(dir.join("logos_token_x").exists(), "must not wipe contents");
+    }
+
+    #[test]
+    fn default_runtime_dir_is_outside_the_project_tree() {
+        // Regression: the Linux default used to be the in-profile `xdg-tmp`.
+        // `launch` leaves Unix sockets there, and `nix build path:<root>#lgx`
+        // refuses to copy a socket, so every install/launch after the first
+        // one failed for a project-root flake.
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        let rt = resolve_profile_runtime_dir(root, "alice", None);
+        let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        assert!(
+            !rt.starts_with(&canon_root),
+            "runtime dir {} must not live inside the project tree {}",
+            rt.display(),
+            canon_root.display()
+        );
+        assert!(
+            rt.to_string_lossy().ends_with("-alice"),
+            "got {}",
+            rt.display()
+        );
+        // Short enough for the macOS sun_path == 104 budget with room for a
+        // `logos_token_<module>_<pid>` leaf.
+        assert!(rt.as_os_str().len() < 60, "got {}", rt.display());
+    }
+
+    #[test]
+    fn default_runtime_dir_is_project_scoped() {
+        let a = tempdir().expect("tempdir");
+        let b = tempdir().expect("tempdir");
+        assert_ne!(
+            resolve_profile_runtime_dir(a.path(), "alice", None),
+            resolve_profile_runtime_dir(b.path(), "alice", None),
+            "two project roots must not share a temp root"
+        );
+    }
+
+    #[test]
+    fn scrub_removes_legacy_in_profile_tmp_dir() {
+        // Projects launched by an older scaffold still carry sockets under
+        // `<profile>/xdg-tmp`; scrubbing lets them heal on the next launch.
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        let profile_dir = root.join(".scaffold/basecamp/profiles/alice");
+        let legacy = profile_dir.join("xdg-tmp");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("logos_token_pkg"), b"x").unwrap();
+
+        scrub_profile_data_and_cache(root, &profile_dir).expect("scrub");
+
+        assert!(!legacy.exists(), "legacy xdg-tmp must be scrubbed");
     }
 
     #[test]
