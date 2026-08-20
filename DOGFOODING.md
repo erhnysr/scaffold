@@ -296,6 +296,7 @@ If the scenario begins with localnet stopped, run `"$SCAFFOLD_BIN" localnet star
 - `doctor --json` returns parseable JSON with at least `status`, `summary`, `checks`, and `next_steps`.
 - `localnet logs --tail 200` returns useful recent log lines when logs exist.
 - `localnet stop` succeeds cleanly and subsequent status reflects the stopped state.
+- The sequencer survives shell/tmux closure: after `localnet start`, detaching the terminal or tmux session should not kill the sequencer. Verify with `localnet status` from a new shell — `running=true` confirms daemon behavior.
 
 ### Failure Signals / Common Pitfalls
 
@@ -1064,7 +1065,7 @@ ls .scaffold/basecamp/profiles
 - `basecamp docs` prints the canonical project-compatibility rules, including per-profile `env_file`, `runtime_dir`, `log_file`, custom profile names, and per-platform `[repos.basecamp.attr]`.
 - First `basecamp setup` clones the pinned basecamp repo into a pin-isolated cache path, builds `basecamp` and `lgpm` via Nix, seeds `.scaffold/basecamp/profiles/alice/` and `.scaffold/basecamp/profiles/bob/`, and reports completion.
 - If `[repos.basecamp.attr]` is a per-platform map, setup uses the current host's attr and preserves the map plus scalar fallback on serialize.
-- `basecamp doctor` reports the basecamp + lgpm binaries as present and both profiles as seeded; `--json` returns parseable JSON with the same checks.
+- `basecamp doctor` reports the basecamp + lgpm binaries as present and both profiles as seeded; `--json` returns parseable JSON with the same checks. Immediately after a green first `setup` (before `basecamp modules`) that is four PASS rows — `basecamp binary`, `lgpm binary`, `basecamp profile alice`, `basecamp profile bob`. A doctor that summarizes `0 PASS` there is the regression: it leaves the user with no confirmation that `setup` actually landed.
 - Second `basecamp setup` is idempotent: pin unchanged → no rebuild reported, exit 0.
 - All commands run only inside the project; running them from outside the project must fail with the existing scaffold "not a logos-scaffold project" message.
 
@@ -1149,9 +1150,11 @@ If your project does not auto-discover correctly, capture explicit sources:
 - An unresolvable dep fails fast with a targeted error naming the dep and the two user-side fixes (capture as a project source, or add `[modules.<name>]` with `role = "dependency"`); no silent drop.
 - `basecamp modules --show` prints the captured set without mutating state.
 - `basecamp install` builds each project source (sibling `--override-input` rewrites apply for `path:../<sibling>` inputs in multi-flake projects) and shells out to `lgpm` to install into both `alice` and `bob`. By default it logs to `.scaffold/logs/<ts>-install.log` and prints a one-line status; `--print-output` (or `LOGOS_SCAFFOLD_PRINT_OUTPUT=1`) streams nix output directly.
-- `basecamp doctor` reports each profile's installed modules matching the captured set; drift between `[modules]` and on-disk profile state is flagged, not hidden.
+- `basecamp doctor` reports each profile's installed modules matching the captured set; drift between `[modules]` and on-disk profile state is flagged, not hidden. Drift is compared on the *normalized* flake ref: `basecamp modules` persists in-project sources relatively (`path:.#lgx`) while discovery yields `path:/abs/root#lgx`, so a doctor that reports `basecamp drift: uncaptured` for a source already present in `[modules]` is comparing raw strings and is a false positive.
 - `basecamp paths <profile> --json` is pure path resolution: it emits parseable JSON for XDG config/data/cache, runtime dir, module/plugin dirs, launch state, log file, and env file without building or mutating anything.
 - Custom profile names launch like default profiles when they are a single safe path component; `env_file` is sourced before global/profile inline env, `runtime_dir` is exported as both `TMPDIR` and `XDG_RUNTIME_DIR`, and `--log-file` overrides the configured `log_file`.
+- `launch` prepares the runtime dir before it scrubs or reinstalls anything, and refuses to use one that is a symlink, is not a directory, or is owned by another user; it creates it `0700` and tightens loose permissions on an existing one. The default sits in world-writable `/tmp` under a name derived from the project path, so a local attacker can claim it first — and whatever lands there holds the modules' `logos_token_*` sockets. A launch that follows a pre-planted symlink, or that scrubs the profile before discovering the runtime dir is unusable, is the regression.
+- With no configured `runtime_dir`, every profile still gets one: `basecamp paths <profile> --json` reports `tmpdir` == `xdg_runtime_dir` == `/tmp/lgs-<project-hash>-<profile>` (the hash scopes it to the project root, so two checkouts never share a temp root). This path is deliberately **outside** the project tree — `launch` leaves live `logos_token_*` Unix sockets in it, and `nix build path:<project-root>#lgx` refuses to copy a socket (`file ... has an unsupported type`). An in-project temp root therefore broke every `basecamp install` / `basecamp launch` after the first launch, and made concurrent `alice` / `bob` launches fail against each other's live sockets. A `tmpdir` that resolves under `<project>/.scaffold/` by default is that regression; so is any socket found by `find .scaffold -type s` after a launch.
 - `basecamp launch alice` kills any prior `logos_host` / `logos-basecamp` descendants for that profile, scrubs the profile's XDG dirs under `.scaffold/basecamp/profiles/alice/`, reinstalls each captured source for that profile, sets `XDG_{CONFIG,DATA,CACHE}_HOME` plus `LOGOS_PROFILE=alice`, and `exec`s basecamp.
 
 ### Failure Signals / Common Pitfalls
@@ -1283,7 +1286,8 @@ test -e .scaffold/basecamp/profiles/alice/.scaffold-xdg-data/scratch/marker.txt 
 - The `marker.txt` file surviving `launch alice` is a regression: clean-slate is the v1 contract.
 - A `launch` scrubbing a path outside the profile's XDG dirs is a severe safety regression — capture the offending path and stop.
 - An empty `[modules]` plus a `launch` that wipes the profile and leaves it empty is a real regression; the empty-modules bail must fire first.
-- A custom `runtime_dir` on macOS that makes `<runtime_dir>/logos_token_<module>_<pid>` exceed the 104-byte Unix socket path budget is a dogfooding finding; keep custom values short, preferably under `/tmp`.
+- A custom `runtime_dir` on macOS that makes `<runtime_dir>/logos_token_<module>_<pid>` exceed the 104-byte Unix socket path budget is a dogfooding finding; keep custom values short, preferably under `/tmp`. Note that a custom `runtime_dir` is resolved relative to the project root, so pointing it back inside the project re-creates the socket-in-the-flake-tree failure described in B2 — prefer an absolute path under `/tmp`.
+- `launch` scrubs `xdg-data`, `xdg-cache`, and the legacy in-profile `xdg-tmp`. The last one matters for profiles first launched by an older scaffold, which left sockets under `<profile>/xdg-tmp`; without that scrub such a project can never build its own root flake again.
 
 ### Evidence to Capture
 
