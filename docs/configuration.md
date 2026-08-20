@@ -7,7 +7,6 @@ for projects that need to change what the pipeline does.
 
 For the command surface itself, see [commands.md](./commands.md).
 
-`lgs run` works with no configuration (setup, via build, → IDL → localnet → topup → deploy).
 To run one or more post-deploy hooks automatically (e.g. submit a transaction
 with [spel](https://github.com/logos-co/spel)), add a `[run]` section to
 `scaffold.toml`. `post_deploy` is a list of shell commands executed in order;
@@ -155,10 +154,6 @@ these filters. Override the debounce per invocation with
 `lgs run --watch --watch-debounce-ms 1500` (CLI wins over
 `[run.watch].debounce_ms`, which wins over the 500ms default).
 
-Checkpoint commands:
-
-```bash
-logos-scaffold localnet status
-logos-scaffold doctor
-```
+To check what a configured run actually did, `lgs localnet status` reports the
+sequencer and `lgs doctor` reports the project.
 

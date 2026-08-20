@@ -58,11 +58,9 @@ event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement.
-
-> **Maintainers:** add a dedicated reporting address here before publicizing
-> this file. Until one exists, reports can be sent through GitHub's
-> [report abuse](https://github.com/contact/report-abuse) flow.
+reported to the maintainers through GitHub's
+[report abuse](https://github.com/contact/report-abuse) flow, or by contacting
+a maintainer directly.
 
 All complaints will be reviewed and investigated promptly and fairly.
 

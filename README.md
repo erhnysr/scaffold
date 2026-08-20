@@ -64,19 +64,22 @@ Full surface: [docs/commands.md](docs/commands.md).
 
 ## Prerequisites
 
-You need these for every command:
+Every command needs these:
 
 - `git`, `rustc`, `cargo` (Rust 1.81 or newer)
 - Unix process helpers: `lsof`, `ps`, `kill`
-- `curl`, to fetch the `logos-blockchain-circuits` release on first `setup`
 
-You need these only for some workflows:
+Some workflows need more:
 
+- `curl`, used by the first `setup` to fetch the pinned
+  `logos-blockchain-circuits` release
 - A container runtime, Docker or Podman, for guest builds
 - `nix` with flakes enabled, for `basecamp` subcommands
-- A `logos-blockchain-circuits` release on disk, required by the LEZ standalone
-  build chain that `setup` invokes. Set `LOGOS_BLOCKCHAIN_CIRCUITS=<path>` or
-  place the release at `~/.logos-blockchain-circuits/`.
+
+Circuits are not a manual step. Scaffold downloads the release pinned in
+`[circuits]` into `.scaffold/circuits` the first time a command needs it. Set
+`LOGOS_BLOCKCHAIN_CIRCUITS=<path>` only to point at a checkout you already
+have.
 
 Run `lgs doctor` to check all of this at once. Add `--json` for CI.
 
@@ -243,7 +246,8 @@ the standalone sequencer flow only, and does not depend on `logos-blockchain`.
 
 ## Example runs
 
-Run the LEZ example programs directly, without passing `.bin` paths:
+A project created from the default template ships example client binaries.
+From that project's root, run them directly, without passing `.bin` paths:
 
 ```bash
 cargo run --bin run_hello_world -- <public_account_id>
