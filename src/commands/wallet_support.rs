@@ -307,12 +307,18 @@ pub(crate) fn is_connectivity_failure(text: &str) -> bool {
 
 /// Like [`is_connectivity_failure`], but also treats a *connect* timeout that
 /// names the sequencer we actually targeted as a connectivity failure.
-/// `sequencer_addr` is the resolved URL (it carries the configured
-/// `[localnet] port`, so this works on custom ports — the old hardcoded
-/// `127.0.0.1:3040` needle did not).
+/// `sequencer_addr` is the resolved URL; only its port is used (it carries the
+/// configured `[localnet] port`, so this works on custom ports — the old
+/// hardcoded `127.0.0.1:3040` needle did not).
 ///
 /// The address is only a co-signal, and the timeout phrase is deliberately
 /// connect-specific:
+/// - A confirmation timeout ("transaction not found in preconfigured amount of
+///   blocks") means the sequencer *was* reached but the tx did not settle in
+///   time; it is excluded FIRST so the caller's dedicated check still fires,
+///   even when that message is reworded to carry one of
+///   [`is_connectivity_failure`]'s generic transport tokens (`"http error"`,
+///   `"error sending request"`).
 /// - A bare URL mention is not enough — logical rejections (bad signature,
 ///   uninitialised account) routinely echo the sequencer URL and must stay
 ///   classified as non-connectivity failures.
@@ -322,24 +328,28 @@ pub(crate) fn is_connectivity_failure(text: &str) -> bool {
 ///   differently ("connection refused", "failed to connect", reqwest's
 ///   "error sending request … operation timed out") are already caught by
 ///   [`is_connectivity_failure`] above.
-/// - A confirmation timeout ("transaction not found in preconfigured amount of
-///   blocks") means the sequencer *was* reached but the tx did not settle in
-///   time; it is excluded so the caller's dedicated check still fires, even if
-///   that message is later reworded to mention a connection or the URL.
+///
+/// The sequencer is matched on its port under both the `127.0.0.1` and
+/// `localhost` aliases (as `doctor`'s `is_localnet_connectivity_failure` does),
+/// because `sequencer_addr` comes from `wallet_config.json` when that file sets
+/// it, so the config form and the wallet's output form can legitimately differ.
+/// The needle is anchored on a trailing-digit boundary, so a configured `:3040`
+/// does not match a message naming `:30401`.
 pub(crate) fn sequencer_connectivity_failure(text: &str, sequencer_addr: &str) -> bool {
-    if is_connectivity_failure(text) {
-        return true;
-    }
     if is_confirmation_timeout_failure(text) {
         return false;
     }
+    if is_connectivity_failure(text) {
+        return true;
+    }
     let lower = text.to_lowercase();
-    let host_port = sequencer_addr
-        .split_once("://")
-        .map_or(sequencer_addr, |(_, rest)| rest)
-        .trim_end_matches('/')
-        .to_lowercase();
-    if host_port.is_empty() || !lower.contains(&host_port) {
+    let Some(port) = sequencer_port(sequencer_addr) else {
+        return false;
+    };
+    let mentions_sequencer = [format!("127.0.0.1:{port}"), format!("localhost:{port}")]
+        .iter()
+        .any(|needle| contains_on_port_boundary(&lower, needle));
+    if !mentions_sequencer {
         return false;
     }
     const CONNECT_TIMEOUT_PHRASES: &[&str] = &[
@@ -351,6 +361,36 @@ pub(crate) fn sequencer_connectivity_failure(text: &str, sequencer_addr: &str) -
     CONNECT_TIMEOUT_PHRASES
         .iter()
         .any(|needle| lower.contains(needle))
+}
+
+/// Extract the port from a resolved sequencer URL, dropping the scheme and any
+/// path/query/fragment so `http://127.0.0.1:3040/rpc` yields `3040` — wallet
+/// output naming only the authority never carries the path, so keeping it would
+/// poison the needle.
+fn sequencer_port(sequencer_addr: &str) -> Option<String> {
+    let authority = sequencer_addr
+        .split_once("://")
+        .map_or(sequencer_addr, |(_, rest)| rest);
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
+    let (_, port) = authority.rsplit_once(':')?;
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(port.to_string())
+}
+
+/// Substring match that rejects a trailing-digit extension, so the needle
+/// `127.0.0.1:3040` matches `…:3040` and `…:3040/rpc` but not `…:30401`.
+fn contains_on_port_boundary(haystack: &str, needle: &str) -> bool {
+    let mut start = 0;
+    while let Some(offset) = haystack[start..].find(needle) {
+        let end = start + offset + needle.len();
+        if !haystack[end..].starts_with(|ch: char| ch.is_ascii_digit()) {
+            return true;
+        }
+        start = end;
+    }
+    false
 }
 
 pub(crate) fn is_uninitialized_account_output(text: &str) -> bool {
@@ -655,6 +695,49 @@ mod tests {
         assert!(
             !sequencer_connectivity_failure(confirmation, default_addr),
             "confirmation timeout must not be reclassified as connectivity"
+        );
+
+        // Same guard, but with a token that `is_connectivity_failure` matches,
+        // so this also pins that the confirmation-timeout check runs *before*
+        // it: moving the guard below the transport check (not just deleting it)
+        // fails this case.
+        assert!(
+            !sequencer_connectivity_failure(
+                "transaction not found in preconfigured amount of blocks \
+                 (http error contacting http://127.0.0.1:3040)",
+                default_addr
+            ),
+            "confirmation timeout carrying a transport token must not be connectivity"
+        );
+
+        // Alias: config names 127.0.0.1 but the wallet's output names localhost.
+        // The port is matched under both aliases, so this is still connectivity.
+        assert!(
+            sequencer_connectivity_failure(
+                "Error: connection timed out contacting localhost:3040",
+                default_addr
+            ),
+            "connect timeout naming the localhost alias of the configured port must be connectivity"
+        );
+
+        // Boundary: a configured port must not match a longer port that merely
+        // has it as a digit prefix (`:3040` vs `:30401`).
+        assert!(
+            !sequencer_connectivity_failure(
+                "Error: connection timed out contacting http://127.0.0.1:30401",
+                default_addr
+            ),
+            "a port that is a digit prefix of the message's port must not classify"
+        );
+
+        // Path in the configured address must not poison the needle: wallet
+        // output naming only the authority still classifies.
+        assert!(
+            sequencer_connectivity_failure(
+                "Error: connection timed out contacting http://127.0.0.1:3040",
+                "http://127.0.0.1:3040/rpc"
+            ),
+            "a path on the configured address must be stripped before matching"
         );
 
         // A success line that merely names the sequencer is not a failure.

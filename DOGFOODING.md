@@ -1691,7 +1691,7 @@ HEAD0=$("$SCAFFOLD_BIN" test-node blocks head --url "$URL" --json | jq -r .block
 
 ### Failure Signals / Common Pitfalls
 
-- `wallet topup` failing with a sequencer-unreachable hint means the test-node is not on the wallet's expected port — start it with `--port <localnet.port>`.
+- `wallet topup` failing with a sequencer-unreachable hint means the test-node is not on the wallet's expected port — start it with `--port <localnet.port>`. The hint keys off the configured `[localnet] port` (not a hardcoded `:3040`), so it is trustworthy on a custom port; if it fires while the sequencer *is* up on that port, treat it as a real connectivity fault, not a port mismatch.
 - A block parser that mis-classifies the user-tx block as clock-only, or reports `fully_parsed: false` on a plain public/deploy tx, against real bytes is a wire-format regression — the highest-value signal this scenario protects.
 - A real sequencer that boots but never executes the tx (block count rises with clock-only blocks but no user tx ever lands) usually means r0vm is missing or version-mismatched — recheck the exact version match in provisioning step 2.
 
