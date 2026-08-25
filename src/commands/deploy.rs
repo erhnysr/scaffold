@@ -236,6 +236,10 @@ pub(crate) fn deploy_for_project(
         if !output.status.success() {
             let summary = summarize_command_failure(&output.stdout, &output.stderr);
             let combined = format!("{}\n{}", output.stdout, output.stderr);
+            // `preflight_sequencer_reachability` already bails on a
+            // Connectivity error before this loop starts, so by the time we
+            // get here the sequencer answered RPC moments ago. This call
+            // mainly earns its keep if the sequencer dies mid-deploy.
             let connectivity_failure = sequencer_connectivity_failure(&combined, &sequencer_addr);
             if !json {
                 println!("FAIL {program} deployment failed");

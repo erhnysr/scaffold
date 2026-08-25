@@ -356,6 +356,7 @@ Both deploy paths honor `--json`, with a different shape each. `--program-path -
 
 - If either `--json` path starts emitting a guaranteed-null `tx` key, or mixes command echoes and the human-readable summary into the JSON stream, record that as a machine-readability regression.
 - If localnet is unreachable, deploy should fail with a sequencer-unavailable hint instead of a vague wallet error.
+- That hint is corroborated by an RPC call (`getLastBlockId`) against the resolved `sequencer_addr` rather than by wallet output alone. The probe separates "refused/unreachable" from "something answered" — it does not verify the responder is our sequencer, so a foreign process squatting on the configured port will still suppress the hint.
 - Unknown program names should report the available discovered programs.
 - Missing binaries should point back to `logos-scaffold build`.
 
@@ -418,6 +419,7 @@ LOGOS_SCAFFOLD_WALLET_PASSWORD="custom-pw" "$SCAFFOLD_BIN" wallet topup --dry-ru
 - Invalid addresses should be rejected with an "Accepted formats" hint.
 - If both positional address and `--address` are supplied together, that is a user error and should remain clearly reported.
 - Connectivity failures during topup should mention localnet/sequencer reachability rather than only raw wallet output.
+- Likewise here: the reachability signal is corroborated via RPC rather than a bare port-open check, but it verifies *something* answered, not that it's our sequencer — a foreign process squatting on the configured port will still suppress the hint.
 - Passthrough flows require the literal `--`; if the CLI starts accepting or mangling passthrough without it, record that change.
 - If wallet flows only succeed when `wallet` is separately installed on `PATH`, or if missing-binary errors point anywhere other than the LEZ-local `target/release/wallet`, record that as a regression.
 - Wallet commands that succeed but enumerate accounts the project never created point at the wallet home falling back to `~/.lee/wallet`. The failure is silent, so do not trust exit code 0: scaffold itself only ever puts `wallet_config.json` into `.scaffold/wallet`, so if `ls .scaffold/wallet` still shows that file alone after a wallet command that should have created or opened account storage, the wallet CLI wrote its storage somewhere else (`~/.lee/wallet`).
