@@ -326,47 +326,57 @@ pub(crate) fn sequencer_connectivity_failure(text: &str, sequencer_addr: &str) -
 /// probe as a parameter so tests can supply a fake instead of hitting a real
 /// endpoint.
 ///
-/// - A confirmation timeout is excluded first so the caller's dedicated
-///   check still owns it, even if reworded to carry a generic transport
-///   token.
-/// - Fast path: the message names both our sequencer (port-matched under the
-///   `127.0.0.1`/`localhost` aliases, boundary-anchored) and an unambiguous
-///   connect-specific phrase — no probe needed. This is deliberate, not just
-///   an optimization: text that explicitly names the connection and our
-///   address is stronger evidence than a generic timeout is, so it is
-///   trusted without a live RPC round-trip.
+/// This does *not* exclude a confirmation timeout. A caller that also submits
+/// transactions — so its subprocess can emit "transaction not found in
+/// preconfigured amount of blocks" — must check
+/// [`is_confirmation_timeout_failure`] *before* this, so a tx that reached the
+/// sequencer but did not settle is reported as pending (with its id) rather
+/// than as connectivity. Folding that exclusion in here only honoured the one
+/// caller that has a confirmation-timeout branch and silently dropped the case
+/// for the callers that submit transactions without one (see the ordering at
+/// `wallet.rs`'s pinata-claim site).
+///
+/// - Fast path: the message names our sequencer (port-matched under the
+///   `127.0.0.1`/`localhost` aliases, boundary-anchored) and carries an
+///   unambiguous connect-specific phrase — no probe needed. This is deliberate,
+///   not just an optimization: text that explicitly names the connection and
+///   our address is stronger evidence than a generic timeout is, so it is
+///   trusted without a live RPC round-trip. It is gated on the configured host
+///   itself being a loopback alias, because the aliases it recognizes are
+///   hardcoded loopback: for a *remote* sequencer a message naming
+///   `localhost:<port>` is a different machine, so it falls through to the
+///   probe (the strictly better signal) instead.
 /// - Fallback: any other message that merely says "timeout" is corroborated
 ///   against `sequencer_addr` via `probe`, since real wallets don't reliably
 ///   name the connection or the address.
-fn sequencer_connectivity_failure_with_probe(
+pub(crate) fn sequencer_connectivity_failure_with_probe(
     text: &str,
     sequencer_addr: &str,
     probe: impl Fn(&str) -> bool,
 ) -> bool {
-    if is_confirmation_timeout_failure(text) {
-        return false;
-    }
     if is_connectivity_failure(text) {
         return true;
     }
     let lower = text.to_lowercase();
 
-    if let Some(port) = sequencer_port(sequencer_addr) {
-        let mentions_sequencer = [format!("127.0.0.1:{port}"), format!("localhost:{port}")]
-            .iter()
-            .any(|needle| contains_on_port_boundary(&lower, needle));
-        if mentions_sequencer {
-            const CONNECT_TIMEOUT_PHRASES: &[&str] = &[
-                "connection timed out",
-                "connect timed out",
-                "connection timeout",
-                "connect timeout",
-            ];
-            if CONNECT_TIMEOUT_PHRASES
+    if sequencer_host_is_loopback(sequencer_addr) {
+        if let Some(port) = sequencer_port(sequencer_addr) {
+            let mentions_sequencer = [format!("127.0.0.1:{port}"), format!("localhost:{port}")]
                 .iter()
-                .any(|needle| lower.contains(needle))
-            {
-                return true;
+                .any(|needle| contains_on_port_boundary(&lower, needle));
+            if mentions_sequencer {
+                const CONNECT_TIMEOUT_PHRASES: &[&str] = &[
+                    "connection timed out",
+                    "connect timed out",
+                    "connection timeout",
+                    "connect timeout",
+                ];
+                if CONNECT_TIMEOUT_PHRASES
+                    .iter()
+                    .any(|needle| lower.contains(needle))
+                {
+                    return true;
+                }
             }
         }
     }
@@ -392,7 +402,7 @@ fn sequencer_connectivity_failure_with_probe(
 /// *something*", not "did it reach our sequencer specifically" — a foreign
 /// process squatting on the configured port still reads as reachable here,
 /// same as it does for `preflight_sequencer_reachability`.
-fn probe_sequencer_reachable(sequencer_addr: &str) -> bool {
+pub(crate) fn probe_sequencer_reachable(sequencer_addr: &str) -> bool {
     match rpc_get_last_block_id(sequencer_addr) {
         Ok(_) => true,
         Err(RpcReachabilityError::Connectivity(_)) => false,
@@ -400,20 +410,47 @@ fn probe_sequencer_reachable(sequencer_addr: &str) -> bool {
     }
 }
 
-/// Extract the port from a resolved sequencer URL, dropping the scheme and any
-/// path/query/fragment so `http://127.0.0.1:3040/rpc` yields `3040` — wallet
-/// output naming only the authority never carries the path, so keeping it would
-/// poison the needle.
-fn sequencer_port(sequencer_addr: &str) -> Option<String> {
-    let authority = sequencer_addr
+/// Strip the scheme and any path/query/fragment from a resolved sequencer URL,
+/// leaving the `[userinfo@]host:port` authority. Wallet output naming only the
+/// authority never carries the path, so keeping it would poison downstream
+/// needle matches (`http://127.0.0.1:3040/rpc` → `127.0.0.1:3040`).
+fn sequencer_authority(sequencer_addr: &str) -> &str {
+    let after_scheme = sequencer_addr
         .split_once("://")
         .map_or(sequencer_addr, |(_, rest)| rest);
-    let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
-    let (_, port) = authority.rsplit_once(':')?;
+    after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme)
+}
+
+/// Extract the port from a resolved sequencer URL so `http://127.0.0.1:3040/rpc`
+/// yields `3040`.
+fn sequencer_port(sequencer_addr: &str) -> Option<String> {
+    let (_, port) = sequencer_authority(sequencer_addr).rsplit_once(':')?;
     if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
     Some(port.to_string())
+}
+
+/// Whether the resolved sequencer URL's host is a loopback alias (`127.0.0.1`,
+/// `localhost`, or the IPv6 `::1`). The zero-probe fast path in
+/// [`sequencer_connectivity_failure_with_probe`] recognizes the sequencer only
+/// under the hardcoded `127.0.0.1`/`localhost` aliases, so it is only sound
+/// when the configured host is itself one of those — a remote sequencer that
+/// merely shares the port must fall through to the probe instead.
+fn sequencer_host_is_loopback(sequencer_addr: &str) -> bool {
+    let authority = sequencer_authority(sequencer_addr);
+    // Drop any `userinfo@`, then the `:port`, leaving the bare host.
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, rest)| rest);
+    let host = host_port
+        .rsplit_once(':')
+        .map_or(host_port, |(host, _)| host);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 /// Substring match that rejects a trailing-digit extension, so the needle
@@ -772,30 +809,40 @@ mod tests {
             "bare transport token must still classify regardless of the probe"
         );
 
-        // Collision guard, pinned independently of the confirmation-timeout
-        // wording: even when the message carries BOTH the connect-timeout phrase
-        // and the sequencer URL, a confirmation timeout must not be reclassified
-        // as connectivity — the caller's dedicated check owns it. This fails if
-        // someone drops the `is_confirmation_timeout_failure` early-return.
-        let confirmation = "transaction not found in preconfigured amount of blocks; \
-             connection timed out contacting http://127.0.0.1:3040";
+        // Confirmation-timeout ordering is now owned by the callers that submit
+        // transactions (see `wallet.rs`'s pinata-claim site), not by this
+        // helper. A both-tokens message — the confirmation line plus a transport
+        // token, which is what a sequencer dying mid-operation looks like once
+        // `combined` is stdout+stderr — therefore classifies as connectivity
+        // here; the caller must check `is_confirmation_timeout_failure` first if
+        // it wants the pending outcome. (Folding the guard into this helper only
+        // honoured the one caller that has a confirmation-timeout branch and
+        // silently dropped the case for the others that submit txs without one.)
         assert!(
-            !sequencer_connectivity_failure_with_probe(confirmation, default_addr, unreachable),
-            "confirmation timeout must not be reclassified as connectivity"
-        );
-
-        // Same guard, but with a token that `is_connectivity_failure` matches,
-        // so this also pins that the confirmation-timeout check runs *before*
-        // it: moving the guard below the transport check (not just deleting it)
-        // fails this case.
-        assert!(
-            !sequencer_connectivity_failure_with_probe(
+            sequencer_connectivity_failure_with_probe(
                 "transaction not found in preconfigured amount of blocks \
                  (http error contacting http://127.0.0.1:3040)",
                 default_addr,
                 unreachable
             ),
-            "confirmation timeout carrying a transport token must not be connectivity"
+            "with the helper no longer owning the confirmation-timeout guard, a \
+             transport token classifies as connectivity; ordering is the caller's job"
+        );
+
+        // Fast-path aliases are hardcoded loopback, so the zero-probe fast path
+        // must only fire when the configured host is itself loopback. A remote
+        // sequencer whose failure text happens to name `localhost:<port>` is a
+        // different machine: the message alone must not classify — it must fall
+        // through to the probe. Here the probe reports reachable, so the result
+        // is NOT connectivity, which it could not be if the fast path had fired.
+        assert!(
+            !sequencer_connectivity_failure_with_probe(
+                "Error: connection timed out contacting localhost:3040",
+                "http://10.0.0.5:3040",
+                reachable
+            ),
+            "a remote sequencer must not take the loopback fast path on a \
+             localhost-named message; the probe decides"
         );
 
         // Alias: config names 127.0.0.1 but the wallet's output names localhost.

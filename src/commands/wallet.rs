@@ -377,20 +377,14 @@ pub(crate) fn cmd_wallet_topup_inner(
     if !output.status.success() {
         let summary = summarize_command_failure(&output.stdout, &output.stderr);
         let combined = format!("{}\n{}", output.stdout, output.stderr);
-        if sequencer_connectivity_failure(&combined, &sequencer_addr) {
-            if json {
-                emit_topup_error_json(
-                    "connectivity",
-                    &format!("wallet topup failed: {summary}"),
-                    &resolved_to,
-                    &sequencer_addr,
-                );
-            }
-            bail!(
-                "wallet topup failed: {summary}\n{}",
-                sequencer_unreachable_hint(&sequencer_addr)
-            );
-        }
+        // Confirmation timeout is checked BEFORE connectivity: once `combined`
+        // is stdout+stderr, a sequencer dying mid-claim can carry both the
+        // "transaction not found in preconfigured amount of blocks" line and a
+        // transport token. This tx reached the sequencer but did not settle, so
+        // it must be reported as pending (with its tx id) rather than as an
+        // unreachable sequencer. `sequencer_connectivity_failure` no longer
+        // excludes the confirmation phrase itself, so this ordering is what owns
+        // the hand-off.
         if is_confirmation_timeout_failure(&combined) {
             let message = confirmation_timeout_message(
                 &resolved_to,
@@ -410,6 +404,20 @@ pub(crate) fn cmd_wallet_topup_inner(
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
             return Ok(TopupOutcome::ConfirmationTimeout { message });
+        }
+        if sequencer_connectivity_failure(&combined, &sequencer_addr) {
+            if json {
+                emit_topup_error_json(
+                    "connectivity",
+                    &format!("wallet topup failed: {summary}"),
+                    &resolved_to,
+                    &sequencer_addr,
+                );
+            }
+            bail!(
+                "wallet topup failed: {summary}\n{}",
+                sequencer_unreachable_hint(&sequencer_addr)
+            );
         }
         if json {
             emit_topup_error_json(

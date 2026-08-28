@@ -2009,6 +2009,40 @@ fn wallet_topup_timeout_exits_non_zero_with_pending_status() {
 }
 
 #[test]
+fn wallet_topup_timeout_with_transport_token_reports_pending_not_connectivity() {
+    // Blocking guard finding: once the classifier sees stdout+stderr combined,
+    // a sequencer dying mid-claim can carry BOTH the confirmation-timeout line
+    // AND a transport token ("connection refused"). The tx reached the
+    // sequencer but did not settle, so the confirmation-timeout branch must win
+    // (status: pending, with the tx id) rather than the connectivity hint.
+    //
+    // `sequencer_connectivity_failure` no longer excludes the confirmation
+    // phrase itself, so the ONLY thing keeping this correct is the check
+    // ordering at the pinata-claim site (is_confirmation_timeout_failure before
+    // the connectivity check). Reverting that order makes this fail: the
+    // connectivity classifier matches "connection refused" and prints
+    // "sequencer appears unavailable" instead, dropping the pending tx id.
+    let temp = tempdir().expect("tempdir");
+    setup_wallet_project(temp.path(), Some("http://127.0.0.1:3040"));
+
+    Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
+        .current_dir(temp.path())
+        .env("TOPUP_FAIL_TIMEOUT_TRANSPORT", "1")
+        .arg("wallet")
+        .arg("topup")
+        .arg("--address")
+        .arg(VALID_PUBLIC_ADDRESS)
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("wallet topup submitted, but confirmation timed out")
+                .and(predicate::str::contains("status: pending"))
+                .and(predicate::str::contains("Tx: pinata-topup-hash"))
+                .and(predicate::str::contains("sequencer appears unavailable").not()),
+        );
+}
+
+#[test]
 fn wallet_topup_fails_outside_project_with_project_scoped_message() {
     let temp = tempdir().expect("tempdir");
 
@@ -2238,6 +2272,51 @@ fn deploy_shows_hint_when_sequencer_is_unreachable_with_fallback_addr() {
 }
 
 #[test]
+fn deploy_classifies_mid_deploy_both_tokens_failure_as_connectivity() {
+    // Restores master behaviour at deploy's per-program failure arm
+    // (deploy.rs:243). The sequencer is reachable at preflight (RpcStub
+    // answers), then dies mid-deploy: the wallet subprocess fails with BOTH the
+    // confirmation-timeout line AND a transport token ("connection refused") in
+    // its combined output. deploy has no confirmation-timeout branch of its
+    // own, so it must classify this as connectivity and print the
+    // sequencer-unavailable hint — not "inspect sequencer logs and retry".
+    //
+    // This is the case the shipped branch (6f2ed30) dropped: the shared
+    // helper's `is_confirmation_timeout_failure` early-return made the combined
+    // message read as non-connectivity here. Removing that early-return re-arms
+    // this path — re-adding it makes this test fail (hint reverts to the
+    // generic retry line).
+    let temp = tempdir().expect("tempdir");
+    let rpc = RpcStub::start();
+    setup_wallet_project(temp.path(), Some(&rpc.url));
+    write_guest_program(temp.path(), "hello");
+    write_guest_binary(temp.path(), "hello");
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
+        .current_dir(temp.path())
+        .env("DEPLOY_FAIL_TIMEOUT_TRANSPORT", "hello.bin")
+        .arg("deploy")
+        .arg("hello")
+        .output()
+        .expect("run deploy against a sequencer that dies mid-deploy");
+
+    assert!(
+        !output.status.success(),
+        "a failed deploy must exit non-zero"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("sequencer appears unavailable"),
+        "a mid-deploy both-tokens failure must classify as connectivity and show \
+         the sequencer-unavailable hint; stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("inspect sequencer logs and retry"),
+        "connectivity classification must replace the generic retry hint; stdout:\n{stdout}"
+    );
+}
+
+#[test]
 fn deploy_prints_program_id_from_vendored_spel() {
     let temp = tempdir().expect("tempdir");
     let rpc = RpcStub::start();
@@ -2411,6 +2490,52 @@ fn deploy_json_output_is_pure_json_no_command_echo() {
         stdout.lines().filter(|l| !l.is_empty()).count(),
         1,
         "stdout must be a single non-empty JSON line; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn deploy_json_stdout_stays_pure_json_when_preflight_probe_returns_other() {
+    // A foreign HTTP responder (404) squatting on the sequencer port maps to
+    // RpcReachabilityError::Other, so `preflight_sequencer_reachability` warns
+    // and continues instead of bailing. That warning runs BEFORE the `--json`
+    // echo guard is installed, so it must be written to stderr: a `println!`
+    // there interleaves non-JSON HTML into the `--json` stdout stream and
+    // breaks `jq`. Pins the `eprintln!` fix — reverting it to `println!` makes
+    // the JSON-parse assertion below fail.
+    let temp = tempdir().expect("tempdir");
+    let rpc = RpcStub::start_http_error();
+    setup_wallet_project(temp.path(), Some(&rpc.url));
+    let custom = temp.path().join("custom.bin");
+    fs::write(&custom, b"stub-program-bin").expect("write custom bin");
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
+        .current_dir(temp.path())
+        .arg("deploy")
+        .arg("--program-path")
+        .arg(&custom)
+        .arg("--json")
+        .output()
+        .expect("run deploy --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // stdout must be a single, valid JSON object — this is what a `println!`
+    // warning breaks (the HTML body lands ahead of the JSON on stdout).
+    let trimmed = stdout.trim();
+    serde_json::from_str::<serde_json::Value>(trimmed).unwrap_or_else(|err| {
+        panic!("deploy --json stdout must be valid JSON; parse error: {err}\nstdout:\n{stdout}")
+    });
+
+    // And the Other arm actually fired (otherwise this test proves nothing):
+    // its warning landed on stderr, not stdout.
+    assert!(
+        stderr.contains("sequencer reachability probe failed"),
+        "the preflight Other-arm warning must be emitted on stderr; stderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("sequencer reachability probe failed"),
+        "the warning must NOT appear on stdout; stdout:\n{stdout}"
     );
 }
 
@@ -3804,6 +3929,16 @@ if [ "$#" -ge 2 ] && [ "$1" = "pinata" ] && [ "$2" = "claim" ]; then
     echo "Error: Transaction not found in preconfigured amount of blocks" >&2
     exit 1
   fi
+  if [ "${TOPUP_FAIL_TIMEOUT_TRANSPORT:-0}" = "1" ]; then
+    # A sequencer dying mid-claim: the tx was submitted (tx_hash on stdout) and
+    # the poller then failed with BOTH the confirmation-timeout line AND a
+    # transport token in the same combined output. The confirmation-timeout
+    # branch must own this (status: pending), not the connectivity classifier.
+    echo "tx_hash=pinata-topup-hash"
+    echo "Error: Transaction not found in preconfigured amount of blocks" >&2
+    echo "error sending request for url (http://127.0.0.1:3040/): Connection refused (os error 111)" >&2
+    exit 1
+  fi
   echo "tx_hash=pinata-topup-hash"
   exit 0
 fi
@@ -3815,6 +3950,15 @@ if [ "$#" -ge 2 ] && [ "$1" = "deploy-program" ]; then
   if [ "${FAIL_PROGRAM:-}" = "$bin_name" ]; then
     echo "simulated deploy failure for $bin_name" >&2
     exit 2
+  fi
+  if [ "${DEPLOY_FAIL_TIMEOUT_TRANSPORT:-}" = "$bin_name" ]; then
+    # Sequencer dying mid-deploy: the submission failed with BOTH the
+    # confirmation-timeout line AND a transport token in the combined output.
+    # deploy's loop must classify this as connectivity (sequencer-unavailable
+    # hint), not "inspect sequencer logs and retry".
+    echo "Error: Transaction not found in preconfigured amount of blocks" >&2
+    echo "error sending request for url (http://127.0.0.1:3040/): Connection refused (os error 111)" >&2
+    exit 1
   fi
   # WALLET_NO_TX=1: simulate the wallet not surfacing a tx identifier so
   # tests can assert the deploy JSON omits the `tx` key when None.
@@ -3921,6 +4065,42 @@ impl RpcStub {
             handle: Some(handle),
         }
     }
+
+    /// Foreign HTTP responder squatting on the sequencer port: answers every
+    /// request with a 404 and an HTML body. `map_ureq_error` maps this to
+    /// `RpcReachabilityError::Other`, so `preflight_sequencer_reachability`
+    /// takes its warn-and-continue arm rather than bailing — the exact arm
+    /// whose warning must land on stderr and not the `--json` stdout stream.
+    fn start_http_error() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind rpc stub");
+        let addr = listener.local_addr().expect("local addr");
+        let addr_str = addr.to_string();
+        listener
+            .set_nonblocking(true)
+            .expect("set nonblocking rpc stub");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => respond_http_404(&mut stream),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            url: format!("http://{addr_str}"),
+            stop,
+            addr: addr_str,
+            handle: Some(handle),
+        }
+    }
 }
 
 impl Drop for RpcStub {
@@ -3931,6 +4111,22 @@ impl Drop for RpcStub {
             let _ = handle.join();
         }
     }
+}
+
+fn respond_http_404(stream: &mut TcpStream) {
+    let mut buf = [0_u8; 4096];
+    let _ = stream.read(&mut buf);
+
+    // HTML with a leading `<`: if this body ever reaches `--json` stdout, `jq`
+    // fails on the first byte ("Invalid numeric literal at line 1, column 8").
+    let body = "<!DOCTYPE HTML><html><body><p>Error code 404: Nothing matches the given URI.</p></body></html>";
+    let response = format!(
+        "HTTP/1.1 404 Not Found\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
 }
 
 fn respond_last_block(stream: &mut TcpStream, block_id: u64) {
