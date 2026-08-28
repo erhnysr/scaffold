@@ -13,9 +13,10 @@ use crate::project::{load_project, resolve_repo_path};
 use crate::DynResult;
 
 use super::wallet_support::{
-    default_sequencer_http_url_for_project, extract_tx_identifier, is_connectivity_failure,
-    load_wallet_runtime, rpc_get_last_block_id, sequencer_unreachable_hint, set_wallet_home_env,
-    summarize_command_failure, wallet_password, RpcReachabilityError,
+    default_sequencer_http_url_for_project, extract_tx_identifier, load_wallet_runtime,
+    probe_sequencer_reachable, rpc_get_last_block_id, sequencer_connectivity_failure_with_probe,
+    sequencer_unreachable_hint, set_wallet_home_env, summarize_command_failure, wallet_password,
+    RpcReachabilityError,
 };
 
 /// Roots searched (in order) for guest `.bin` artefacts. Both layouts exist in
@@ -158,6 +159,22 @@ pub(crate) fn deploy_for_project(
     let pace_deploys = selected_programs.len() > 1;
     let mut prev_submission_head: Option<u64> = None;
 
+    // The reachability probe asks a network-level question whose answer is the
+    // same for every program in this run, so cache it: if the sequencer dies
+    // mid-deploy and several programs fail in a row, they issue at most one
+    // probe between them and cannot disagree with each other. The per-program
+    // text classification still runs per program; only the socket probe is
+    // memoized here.
+    let cached_reachable: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
+    let probe_once = |addr: &str| match cached_reachable.get() {
+        Some(reachable) => reachable,
+        None => {
+            let reachable = probe_sequencer_reachable(addr);
+            cached_reachable.set(Some(reachable));
+            reachable
+        }
+    };
+
     let mut results = Vec::new();
     let mut remaining = selected_programs.into_iter();
     while let Some(program) = remaining.next() {
@@ -236,7 +253,14 @@ pub(crate) fn deploy_for_project(
         if !output.status.success() {
             let summary = summarize_command_failure(&output.stdout, &output.stderr);
             let combined = format!("{}\n{}", output.stdout, output.stderr);
-            let connectivity_failure = is_connectivity_failure(&combined);
+            // `preflight_sequencer_reachability` already bails on a
+            // Connectivity error before this loop starts, so by the time we
+            // get here the sequencer answered RPC moments ago. This call
+            // mainly earns its keep if the sequencer dies mid-deploy. The probe
+            // is memoized via `probe_once`, so a mid-deploy death costs one
+            // probe for the whole run rather than one per remaining program.
+            let connectivity_failure =
+                sequencer_connectivity_failure_with_probe(&combined, &sequencer_addr, &probe_once);
             if !json {
                 println!("FAIL {program} deployment failed");
                 println!("  Error: {summary}");
@@ -476,7 +500,12 @@ fn preflight_sequencer_reachability(sequencer_addr: &str) -> DynResult<()> {
             )
         }
         Err(err) => {
-            println!(
+            // stderr, not stdout: this runs before the `--json` echo guard is
+            // installed at both call sites, so a `println!` here interleaves a
+            // non-JSON warning into a `--json` stdout stream and breaks `jq`.
+            // The warning is diagnostic, so stderr is the right sink regardless
+            // of `--json`.
+            eprintln!(
                 "warning: sequencer reachability probe failed ({err}); continuing with wallet submission mode"
             );
             Ok(())

@@ -357,6 +357,8 @@ Both deploy paths honor `--json`, with a different shape each. `--program-path -
 
 - If either `--json` path starts emitting a guaranteed-null `tx` key, or mixes command echoes and the human-readable summary into the JSON stream, record that as a machine-readability regression.
 - If localnet is unreachable, deploy should fail with a sequencer-unavailable hint instead of a vague wallet error.
+- That hint is corroborated by an RPC call (`getLastBlockId`) against the resolved `sequencer_addr` rather than by wallet output alone. The probe separates "refused/unreachable" from "something answered" — it does not verify the responder is our sequencer, so a foreign process squatting on the configured port will still suppress the hint.
+- Two unreachable shapes are worth distinguishing, and only the first is covered by stopping localnet. **Refused** (`localnet stop`, nothing listening) fails fast. **Blackholed** (SYN dropped — firewalled host, wrong host, host down) is reproduced by pointing the project's sequencer at an unrouted address, e.g. `10.255.255.1:3040`, and re-running `deploy`. Both must fail with the sequencer-unavailable hint (bounded by the ~1s connect timeout, so it is fast, not a 30s hang). If the blackholed one instead prints `warning: sequencer reachability probe failed (...); continuing` and then a vague wallet error, that is the regression this signal protects — the preflight classified a connect *timeout* as "something else" and burned a wallet submission against a dead address.
 - Unknown program names should report the available discovered programs.
 - Missing binaries should point back to `logos-scaffold build`.
 
@@ -419,6 +421,8 @@ LOGOS_SCAFFOLD_WALLET_PASSWORD="custom-pw" "$SCAFFOLD_BIN" wallet topup --dry-ru
 - Invalid addresses should be rejected with an "Accepted formats" hint.
 - If both positional address and `--address` are supplied together, that is a user error and should remain clearly reported.
 - Connectivity failures during topup should mention localnet/sequencer reachability rather than only raw wallet output.
+- Likewise here: the reachability signal is corroborated via RPC rather than a bare port-open check, but it verifies *something* answered, not that it's our sequencer — a foreign process squatting on the configured port will still suppress the hint.
+- Timing asymmetry versus `deploy`: `deploy` runs a reachability preflight and so bails on a blackholed sequencer in ~1s, whereas `topup` has no preflight — it first pays the wallet subprocess's own timeout (on the order of a minute against an unrouted address) and only then classifies and prints the corrected hint. The eventual hint is correct and is the improvement here; the wait before it is expected, not a hang. Do not treat the delay as a failure signal.
 - Passthrough flows require the literal `--`; if the CLI starts accepting or mangling passthrough without it, record that change.
 - If wallet flows only succeed when `wallet` is separately installed on `PATH`, or if missing-binary errors point anywhere other than the LEZ-local `target/release/wallet`, record that as a regression.
 - Wallet commands that succeed but enumerate accounts the project never created point at the wallet home falling back to `~/.lee/wallet`. The failure is silent, so do not trust exit code 0: scaffold itself only ever puts `wallet_config.json` into `.scaffold/wallet`, so if `ls .scaffold/wallet` still shows that file alone after a wallet command that should have created or opened account storage, the wallet CLI wrote its storage somewhere else (`~/.lee/wallet`).
@@ -1767,7 +1771,7 @@ HEAD0=$("$SCAFFOLD_BIN" test-node blocks head --url "$URL" --json | jq -r .block
 
 ### Failure Signals / Common Pitfalls
 
-- `wallet topup` failing with a sequencer-unreachable hint means the test-node is not on the wallet's expected port — start it with `--port <localnet.port>`.
+- `wallet topup` failing with a sequencer-unreachable hint means the test-node is not on the wallet's expected port — start it with `--port <localnet.port>`. The hint keys off the configured `[localnet] port` (not a hardcoded `:3040`), so it is trustworthy on a custom port; if it fires while the sequencer *is* up on that port, treat it as a real connectivity fault, not a port mismatch.
 - A block parser that mis-classifies the user-tx block as clock-only, or reports `fully_parsed: false` on a plain public/deploy tx, against real bytes is a wire-format regression — the highest-value signal this scenario protects.
 - A real sequencer that boots but never executes the tx (block count rises with clock-only blocks but no user tx ever lands) usually means r0vm is missing or version-mismatched — recheck the exact version match in provisioning step 2.
 
